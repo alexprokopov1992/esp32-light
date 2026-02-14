@@ -75,6 +75,9 @@ static const char *TAG = "power_pinger";
 #define KEY_LAST_OFF_TIME       "last_off"     // i64 epoch
 #define KEY_LAST_ON_TIME        "last_on"      // i64 epoch
 
+#define KEY_GS_URL             "gs_url"      // string: Apps Script WebApp URL (optional)
+#define KEY_GS_SECRET          "gs_sec"      // string: simple shared secret (optional)
+#define KEY_DEVICE_ID          "dev_id"      // string: device name/id (optional)
 /* ---------- WiFi events ---------- */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -88,7 +91,14 @@ typedef struct {
     char tg_token[128];
     char tg_chat[64];
     char ping_ip[16]; // "192.168.1.1"
+
+    // Optional: Google Sheets webhook (Apps Script Web App)
+    char gs_url[256];
+    char gs_secret[64];
+    char device_id[32];
+
     bool valid;
+    bool gs_enabled;
 } app_cfg_t;
 
 static app_cfg_t g_cfg;
@@ -134,6 +144,26 @@ static esp_err_t nvs_get_str_safe(nvs_handle_t h, const char *key, char *out, si
     return nvs_get_str(h, key, out, &required);
 }
 
+static void nvs_get_str_optional(nvs_handle_t h, const char *key, char *out, size_t out_sz) {
+    // If key doesn't exist or invalid -> return empty string
+    out[0] = 0;
+    size_t required = 0;
+    esp_err_t err = nvs_get_str(h, key, NULL, &required);
+    if (err != ESP_OK) return;
+    if (required == 0 || required > out_sz) return;
+    (void)nvs_get_str(h, key, out, &required);
+}
+
+static esp_err_t nvs_set_str_or_erase(nvs_handle_t h, const char *key, const char *val) {
+    if (!val || val[0] == 0) {
+        // erase if empty (keeps NVS clean)
+        esp_err_t err = nvs_erase_key(h, key);
+        if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+        return err;
+    }
+    return nvs_set_str(h, key, val);
+}
+
 static bool load_cfg_from_nvs(app_cfg_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     nvs_handle_t h;
@@ -144,7 +174,20 @@ static bool load_cfg_from_nvs(app_cfg_t *cfg) {
     esp_err_t e3 = nvs_get_str_safe(h, KEY_TG_TOKEN, cfg->tg_token, sizeof(cfg->tg_token));
     esp_err_t e4 = nvs_get_str_safe(h, KEY_TG_CHAT, cfg->tg_chat, sizeof(cfg->tg_chat));
     esp_err_t e5 = nvs_get_str_safe(h, KEY_PING_IP, cfg->ping_ip, sizeof(cfg->ping_ip));
+
+    // Optional fields
+    nvs_get_str_optional(h, KEY_GS_URL, cfg->gs_url, sizeof(cfg->gs_url));
+    nvs_get_str_optional(h, KEY_GS_SECRET, cfg->gs_secret, sizeof(cfg->gs_secret));
+    nvs_get_str_optional(h, KEY_DEVICE_ID, cfg->device_id, sizeof(cfg->device_id));
+
     nvs_close(h);
+
+    // Defaults for optional fields
+    if (cfg->device_id[0] == 0) {
+        strncpy(cfg->device_id, "power_pinger", sizeof(cfg->device_id));
+        cfg->device_id[sizeof(cfg->device_id) - 1] = 0;
+    }
+    cfg->gs_enabled = (cfg->gs_url[0] != 0);
 
     cfg->valid = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK && e5 == ESP_OK &&
                   strlen(cfg->ssid) > 0 && strlen(cfg->tg_token) > 0 && strlen(cfg->tg_chat) > 0 &&
@@ -162,6 +205,12 @@ static bool save_cfg_to_nvs(const app_cfg_t *cfg) {
     err |= nvs_set_str(h, KEY_TG_TOKEN, cfg->tg_token);
     err |= nvs_set_str(h, KEY_TG_CHAT, cfg->tg_chat);
     err |= nvs_set_str(h, KEY_PING_IP, cfg->ping_ip);
+
+    // Optional fields
+    err |= nvs_set_str_or_erase(h, KEY_GS_URL, cfg->gs_url);
+    err |= nvs_set_str_or_erase(h, KEY_GS_SECRET, cfg->gs_secret);
+    err |= nvs_set_str_or_erase(h, KEY_DEVICE_ID, cfg->device_id);
+
     err |= nvs_commit(h);
     nvs_close(h);
     return (err == ESP_OK);
@@ -263,6 +312,94 @@ static esp_err_t tg_send_message(const char *token, const char *chat_id, const c
     return err;
 }
 
+/* ---------- Google Sheets (Apps Script Web App webhook) ---------- */
+/*
+   Idea: deploy Google Apps Script as a Web App with doPost() that appends a row to a Sheet.
+   ESP32 sends JSON: {device,state,ts,iso,duration,secret}
+*/
+static void json_escape(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = 0;
+    if (!in) return;
+
+    size_t oi = 0;
+    for (size_t i = 0; in[i] && oi + 2 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\"' || c == '\\\\') {
+            if (oi + 2 >= out_sz) break;
+            out[oi++] = '\\\\';
+            out[oi++] = (char)c;
+        } else if (c < 0x20) {
+            out[oi++] = ' ';
+        } else {
+            out[oi++] = (char)c;
+        }
+    }
+    out[oi] = 0;
+}
+
+static void format_iso_local(int64_t epoch_s, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = 0;
+    time_t t = (time_t)epoch_s;
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    // Example: 2026-02-15 12:34:56 (Kyiv local, because TZ is set)
+    strftime(out, out_sz, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+static esp_err_t gsheets_post_event(const char *state, int64_t epoch_s, const char *duration_str) {
+    if (!g_cfg.gs_enabled || g_cfg.gs_url[0] == 0) return ESP_OK;
+
+    char iso[32];
+    format_iso_local(epoch_s, iso, sizeof(iso));
+
+    char dev_esc[64], st_esc[16], dur_esc[64], sec_esc[96];
+    json_escape(g_cfg.device_id, dev_esc, sizeof(dev_esc));
+    json_escape(state, st_esc, sizeof(st_esc));
+    json_escape(duration_str ? duration_str : "", dur_esc, sizeof(dur_esc));
+    json_escape(g_cfg.gs_secret, sec_esc, sizeof(sec_esc));
+
+    char body[512];
+    // Keep the payload small to avoid fragmentation / big buffers
+    snprintf(body, sizeof(body),
+             "{"
+             "\"device\":\"%s\","
+             "\"state\":\"%s\","
+             "\"ts\":%lld,"
+             "\"iso\":\"%s\","
+             "\"duration\":\"%s\","
+             "\"secret\":\"%s\""
+             "}",
+             dev_esc, st_esc, (long long)epoch_s, iso, dur_esc, sec_esc);
+
+    esp_http_client_config_t cfg = {
+        .url = g_cfg.gs_url,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_FAIL;
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, (int)strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "GSheets webhook HTTP %d", code);
+        if (!((code >= 200 && code < 300) || code == 405))  err = ESP_FAIL;
+    } else {
+        ESP_LOGW(TAG, "GSheets webhook failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+
 /* ---------- WEB UI (AP + HTTP) ---------- */
 static const char *HTML_FORM =
 "<!doctype html><html><head><meta charset='utf-8'/>"
@@ -279,6 +416,9 @@ static const char *HTML_FORM =
 "<label>Telegram bot token</label><input name='tg_token' required>"
 "<label>Telegram channel/chat id</label><input name='tg_chat' required>"
 "<label>IP device to ping</label><input name='ping_ip' placeholder='192.168.1.1' required>"
+"<label>Device name (optional)</label><input name='dev_id' placeholder='power_pinger'>"
+"<label>Google Sheets webhook URL (optional)</label><input name='gs_url' placeholder='https://script.google.com/macros/s/.../exec'>"
+"<label>Google Sheets secret (optional)</label><input name='gs_sec' type='password' placeholder='shared secret'>"
 "<button type='submit'>Save & Reboot</button>"
 "</form></body></html>";
 
@@ -329,7 +469,7 @@ static void form_get(const char *body, const char *key, char *out, size_t out_sz
 }
 
 static esp_err_t http_save_post(httpd_req_t *req) {
-    char buf[512];
+    char buf[2048];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(buf)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad content length");
@@ -349,6 +489,14 @@ static esp_err_t http_save_post(httpd_req_t *req) {
     form_get(buf, "tg_token", cfg.tg_token, sizeof(cfg.tg_token));
     form_get(buf, "tg_chat", cfg.tg_chat, sizeof(cfg.tg_chat));
     form_get(buf, "ping_ip", cfg.ping_ip, sizeof(cfg.ping_ip));
+    form_get(buf, "dev_id", cfg.device_id, sizeof(cfg.device_id));
+    form_get(buf, "gs_url", cfg.gs_url, sizeof(cfg.gs_url));
+    form_get(buf, "gs_sec", cfg.gs_secret, sizeof(cfg.gs_secret));
+
+    if (cfg.device_id[0] == 0) {
+        strncpy(cfg.device_id, "power_pinger", sizeof(cfg.device_id));
+        cfg.device_id[sizeof(cfg.device_id) - 1] = 0;
+    }
 
     if (strlen(cfg.ssid) == 0 || strlen(cfg.pass) == 0 ||
         strlen(cfg.tg_token) == 0 || strlen(cfg.tg_chat) == 0 ||
@@ -595,6 +743,7 @@ static void notify_power_off(int64_t off_time, int64_t last_on_time) {
              dur);
 
     (void)tg_send_message(g_cfg.tg_token, g_cfg.tg_chat, msg);
+    (void)gsheets_post_event("OFF", off_time, dur);
 }
 
 static void notify_power_on(int64_t on_time, int64_t last_off_time) {
@@ -607,6 +756,7 @@ static void notify_power_on(int64_t on_time, int64_t last_off_time) {
              dur);
 
     (void)tg_send_message(g_cfg.tg_token, g_cfg.tg_chat, msg);
+    (void)gsheets_post_event("ON", on_time, dur);
 }
 
 // ✅ "щось живе": був успішний ping за останні OFF_CONFIRM_MS
