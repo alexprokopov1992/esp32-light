@@ -7,25 +7,24 @@
 const CFG = {
   LOG_SHEET: 'log',
   REPORT_SHEET: '_report',
-  // если нужно только одно устройство — впиши его id, иначе оставь ''
   DEVICE_FILTER: 'pinger',
-  // подписи в легенде
   LABEL_ON: 'Світло було',
   LABEL_OFF: 'Світла не було',
+  LABEL_UNK: 'Невідомо',          // <-- додали
 };
 
 function doPost(e) {
   const body = (e && e.postData && e.postData.contents) ? e.postData.contents : '';
   let j = {};
   try { j = body ? JSON.parse(body) : {}; } catch (_) {}
-
   // Команда на отчёт (HA/Cloud Scheduler/ручной запрос)
   if (String(j.action || '') === 'weekly_report') {
     if (!checkSecret_(j.secret)) return text_('bad secret');
-    sendWeeklyReport_();
-    return text_('report sent');
+    return withLock_(() => {
+      sendWeeklyReport_();
+      return text_('report sent');
+    });
   }
-
   // Обычный лог от ESP32
   if (!checkSecret_(j.secret)) return text_('bad secret');
 
@@ -38,11 +37,24 @@ function doGet(e) {
   const p = (e && e.parameter) ? e.parameter : {};
   if (String(p.action || '') === 'weekly_report') {
     if (!checkSecret_(p.secret)) return text_('bad secret');
-    sendWeeklyReport_();
-    return text_('report sent');
+    return withLock_(() => {
+      sendWeeklyReport_();
+      return text_('report sent');
+    });
   }
   return text_('ok');
 }
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000); // до 30с ждём, если уже идёт генерация
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 
 function text_(s) {
   return ContentService.createTextOutput(String(s))
@@ -82,24 +94,29 @@ function appendEvent_(j) {
   ]);
 }
 
+function getWeekStartMonday_(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  const dow = x.getDay();          // 0=Sun..6=Sat
+  const diffToMon = (dow + 6) % 7; // сколько дней назад был понедельник
+  x.setDate(x.getDate() - diffToMon);
+  return x; // понедельник 00:00
+}
+
 function sendWeeklyReport_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // Берём последние 7 ПОЛНЫХ суток: [end-7d .. end), где end = сегодня 00:00
-  const end = new Date();
-  end.setHours(0, 0, 0, 0);
-  const start = new Date(end);
-  start.setDate(start.getDate() - 7);
+  const generatedAt = new Date();               // час генерації
+  const start = getWeekStartMonday_(generatedAt);
+  const end = new Date(start); end.setDate(end.getDate() + 7);
 
-  const events = loadEvents_(ss, start, end);
-  if (!events.length) {
-    telegramSendText_('Немає даних для звіту за останні 7 діб.');
-    return;
-  }
+  // Дані беремо ТІЛЬКИ до generatedAt (щоб майбутнє було біле)
+  const dataEnd = new Date(Math.min(end.getTime(), generatedAt.getTime()));
 
-  const built = buildSegments_(events, start, end);
+  const events = loadEvents_(ss, start, dataEnd);
+  const built = buildSegments_(events, start, dataEnd);
 
-  const chartBlob = buildChartPng_(ss, built.rowsForChart);
+  const chartBlob = buildChartPng_(ss, built.rowsForChart, start, end, generatedAt);
   telegramSendPhoto_(chartBlob, built.caption);
 }
 
@@ -107,25 +124,24 @@ function loadEvents_(ss, start, end) {
   const sh = ss.getSheetByName(CFG.LOG_SHEET);
   if (!sh || sh.getLastRow() < 2) return [];
 
-  const values = sh.getDataRange().getValues(); // includes header
+  const values = sh.getDataRange().getValues();
   const hdr = values[0].map(v => String(v).toLowerCase());
 
   const colTs = hdr.indexOf('ts');
   const colDev = hdr.indexOf('device');
   const colState = hdr.indexOf('state');
-
   if (colTs < 0 || colState < 0) return [];
 
-  // захватываем “чуть раньше”, чтобы понять состояние на границе start
-  const startMinus = new Date(start);
-  startMinus.setDate(startMinus.getDate() - 2);
-
+  let lastBefore = null;
   const out = [];
+
   for (let i = 1; i < values.length; i++) {
     const r = values[i];
+
     const dev = (colDev >= 0) ? String(r[colDev] || '') : '';
     if (CFG.DEVICE_FILTER && dev !== CFG.DEVICE_FILTER) continue;
 
+    // parse time
     const tsCell = r[colTs];
     let t = null;
     if (tsCell instanceof Date) t = tsCell;
@@ -135,14 +151,18 @@ function loadEvents_(ss, start, end) {
       t = (n > 1e12) ? new Date(n) : new Date(n * 1000); // ms or sec
     }
 
-    if (t < startMinus || t >= end) continue;
+    const state = normalizeState_(r[colState]);
 
-    out.push({
-      t: t,
-      state: normalizeState_(r[colState]),
-    });
+    if (t < start) {
+      if (!lastBefore || t > lastBefore.t) lastBefore = { t, state };
+      continue;
+    }
+    if (t >= end) continue;
+
+    out.push({ t, state });
   }
 
+  if (lastBefore) out.unshift(lastBefore);
   out.sort((a, b) => a.t - b.t);
   return out;
 }
@@ -150,7 +170,6 @@ function loadEvents_(ss, start, end) {
 // Строим интервалы ON/OFF и готовим строки для TIMELINE чарта так,
 // чтобы ось была 0..24 (все дни “ложим” на одну базовую дату, а дни различаем rowLabel)
 function buildSegments_(events, start, end) {
-  // базовая дата для оси времени (важно: одна и та же для всех дней)
   const BASE = new Date(2000, 0, 1, 0, 0, 0, 0);
 
   function dayLabel_(d) {
@@ -160,27 +179,27 @@ function buildSegments_(events, start, end) {
     return `${wd} (${dd}.${mm})`;
   }
 
-  function toBaseTime_(d, isEndMidnightNextDay) {
+  // endAtDayEnd=true -> 23:59:59.999 (НЕ 02.01.2000 00:00)
+  function toBaseTime_(d, endAtDayEnd) {
     const b = new Date(BASE);
-    b.setHours(d.getHours(), d.getMinutes(), d.getSeconds(), 0);
-    if (isEndMidnightNextDay) b.setDate(b.getDate() + 1); // 24:00 как 00:00 следующего дня
+    if (endAtDayEnd) {
+      b.setHours(23, 59, 59, 0);
+    } else {
+      b.setHours(d.getHours(), d.getMinutes(), d.getSeconds(), 0);
+    }
     return b;
   }
 
-  // состояние на start: последнее событие до start
   let curState = 'UNK';
   for (let i = events.length - 1; i >= 0; i--) {
     if (events[i].t < start) { curState = events[i].state; break; }
   }
-  if (curState === 'UNK') curState = 'OFF'; // можно поменять на ON, если тебе так логичнее
+  if (curState === 'UNK') curState = 'OFF';
 
-  // события внутри окна
   const inWindow = events.filter(e => e.t >= start && e.t < end);
 
-  // raw segments (для статистики)
   const raw = [];
   let curT = new Date(start);
-
   for (const ev of inWindow) {
     if (ev.t > curT) raw.push({ state: curState, a: new Date(curT), b: new Date(ev.t) });
     curState = ev.state;
@@ -188,7 +207,6 @@ function buildSegments_(events, start, end) {
   }
   if (curT < end) raw.push({ state: curState, a: new Date(curT), b: new Date(end) });
 
-  // split by days, then map to BASE time for chart
   const rowsForChart = [];
   const ONE_DAY = 24 * 3600 * 1000;
 
@@ -202,23 +220,41 @@ function buildSegments_(events, start, end) {
 
       const label = dayLabel_(dayStart);
 
-      const endIsMidnightNextDay =
-        (partEnd.getHours() === 0 && partEnd.getMinutes() === 0 && partEnd.getSeconds() === 0) &&
-        (partEnd.getTime() === dayEnd.getTime()) &&
-        (partEnd.getTime() > a.getTime());
+      const endAtDayEnd =
+        partEnd.getTime() === dayEnd.getTime() && partEnd.getTime() > a.getTime();
 
-      rowsForChart.push([
-        label,
-        (seg.state === 'ON') ? CFG.LABEL_ON : CFG.LABEL_OFF,
-        toBaseTime_(a, false),
-        toBaseTime_(partEnd, endIsMidnightNextDay),
-      ]);
+      const s = toBaseTime_(a, false);
+      const e = toBaseTime_(partEnd, endAtDayEnd);
+
+      // ЖЁСТКИЙ CLAMP: диапазон строго внутри 01.01.2000 00:00:00.000 .. 01.01.2000 23:59:59.999
+      const base0 = BASE.getTime();
+      const baseEnd = base0 + 24 * 3600 * 1000 - 1000; // последний миллисекунд дня
+
+      let sT = s.getTime();
+      let eT = e.getTime();
+
+      // если вдруг получилось 02.01.2000 00:00:00 -> прижимаем к 23:59:59.999
+      if (sT < base0) sT = base0;
+      if (eT > baseEnd) eT = baseEnd;
+
+      // защита от нулевых/битых интервалов
+      if (eT > sT) {
+        rowsForChart.push([
+          label,
+          (seg.state === 'ON') ? CFG.LABEL_ON :
+          (seg.state === 'OFF') ? CFG.LABEL_OFF : CFG.LABEL_UNK,
+          new Date(sT),
+          new Date(eT),
+        ]);
+      }
 
       a = partEnd;
     }
   }
 
-  // статистика для подписи
+  // ... твоя статистика/caption без изменений ...
+  // return { rowsForChart, caption };
+
   let onMs = 0, offMs = 0, outages = 0;
   let prev = null;
   for (const seg of raw) {
@@ -237,31 +273,193 @@ function buildSegments_(events, start, end) {
   return { rowsForChart, caption };
 }
 
-function buildChartPng_(ss, rows) {
+function buildChartPng_(ss, rows, start, end, generatedAt) {
   const sh = ss.getSheetByName(CFG.REPORT_SHEET) || ss.insertSheet(CFG.REPORT_SHEET);
   sh.clearContents();
-
-  // Данные для Timeline chart: RowLabel | BarLabel | Start | End
   sh.getRange(1, 1, 1, 4).setValues([['day', 'state', 'start', 'end']]);
-  if (rows.length) sh.getRange(2, 1, rows.length, 4).setValues(rows);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, 4).setValues(rows);
+    sh.getRange(2, 3, rows.length, 2).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+  }
 
-  const range = sh.getRange(1, 1, rows.length + 1, 4);
+  const title =
+    `Графік відключень світла ${fmtDM_(start)} – ${fmtDM_(new Date(end.getTime() - 1))}`;
 
-  // Встроенный chart через Spreadsheet service:
-  // builder.setChartType(Charts.ChartType.*) :contentReference[oaicite:1]{index=1}
-  const chart = sh.newChart()
-    .setChartType(Charts.ChartType.TIMELINE)
-    .addRange(range)
-    .setNumHeaders(1)
-    .setOption('timeline', { groupByRowLabel: true, showBarLabels: false })
-    .setOption('hAxis', { format: 'H' }) // показываем только часы
-    .setOption('colors', ['#4CAF50', '#F44336']) // ON / OFF
-    .setOption('legend', { position: 'bottom' })
-    .setPosition(1, 6, 0, 0)
-    .build();
+  return buildStackedBarPng_(rows, title, start, end, generatedAt);
+}
 
-  // chart.getAs('image/png') :contentReference[oaicite:2]{index=2}
-  return chart.getAs('image/png').setName('power_week.png');
+function fmtDM_(d) {
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}`;
+}
+
+function buildStackedBarPng_(rows, title, weekStart, weekEnd, generatedAt) {
+  const GREEN = '#57E64B';
+  const RED   = '#FF6B5E';
+  const GREY  = '#B0B0B0';
+  const WHITE = '#FFFFFF';
+
+  const DAY_WD = ['НД','ПН','ВТ','СР','ЧТ','ПТ','СБ'];
+
+  function dayLabelForDate_(d) {
+    const wd = DAY_WD[d.getDay()];
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    return `${wd} (${dd}.${mm})`;
+  }
+
+  function secOfDay_(d) {
+    return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+  }
+
+  function endSec_(dt) {
+    // 23:59:59 трактуємо як 24:00
+    const h = dt.getHours(), m = dt.getMinutes(), s = dt.getSeconds();
+    if (h === 23 && m === 59 && s === 59) return 24 * 3600;
+    return h * 3600 + m * 60 + s;
+  }
+
+  // 1) з rows робимо map: dayLabel -> segments[{kind,aS,bS}]
+  // kind: 'ON' | 'OFF' | 'UNK'
+  const map = new Map();
+  for (const r of rows) {
+    const day = String(r[0] || '');
+    const stLabel = String(r[1] || '');
+    const a = new Date(r[2]);
+    const b = new Date(r[3]);
+
+    let aS = secOfDay_(a);
+    let bS = endSec_(b);
+    if (bS <= aS) continue;
+
+    let kind = 'UNK';
+    if (stLabel === CFG.LABEL_ON) kind = 'ON';
+    else if (stLabel === CFG.LABEL_OFF) kind = 'OFF';
+    else kind = 'UNK';
+
+    if (!map.has(day)) map.set(day, []);
+    map.get(day).push({ kind, aS, bS });
+  }
+
+  // 2) формуємо 7 днів тижня (включаючи майбутні) -> для кожного робимо повну шкалу 0..24:
+  //   [0..cutoff)=дані або UNK, [cutoff..24)=FUTURE(WHITE)
+  const genDay0 = new Date(generatedAt); genDay0.setHours(0,0,0,0);
+
+  const dayRows = [];
+  let maxSegs = 0;
+
+  for (let i = 0; i < 7; i++) {
+    const d0 = new Date(weekStart);
+    d0.setDate(d0.getDate() + i);
+    d0.setHours(0,0,0,0);
+
+    const label = dayLabelForDate_(d0);
+
+    // cutoffSec: до цього часу день "відомий/минуле", після — FUTURE
+    let cutoffSec;
+    if (d0.getTime() < genDay0.getTime()) cutoffSec = 24 * 3600;            // минулий день
+    else if (d0.getTime() > genDay0.getTime()) cutoffSec = 0;               // майбутній день
+    else cutoffSec = secOfDay_(generatedAt);                                // сьогодні: до часу генерації
+
+    // беремо сегменти цього дня (якщо є)
+    let segs = (map.get(label) || []).slice();
+    segs.sort((x,y) => x.aS - y.aS);
+
+    // обрізаємо сегменти до cutoffSec
+    const clipped = [];
+    for (const s of segs) {
+      if (s.bS <= 0) continue;
+      if (s.aS >= cutoffSec) continue;
+      clipped.push({
+        kind: s.kind,
+        aS: Math.max(0, s.aS),
+        bS: Math.min(cutoffSec, s.bS),
+      });
+    }
+    clipped.sort((x,y) => x.aS - y.aS);
+
+    // заповнюємо "дірки" UNK до cutoffSec
+    const full = [];
+    let t = 0;
+    for (const s of clipped) {
+      if (s.aS > t) full.push({ kind:'UNK', aS:t, bS:s.aS });
+      full.push(s);
+      t = Math.max(t, s.bS);
+    }
+    if (t < cutoffSec) full.push({ kind:'UNK', aS:t, bS:cutoffSec });
+
+    // додаємо FUTURE (біле)
+    if (cutoffSec < 24 * 3600) {
+      full.push({ kind:'FUT', aS:cutoffSec, bS:24*3600 });
+    }
+
+    // мерджимо однакові підряд
+    const merged = [];
+    for (const s of full) {
+      const durH = (s.bS - s.aS) / 3600;
+      if (durH <= 0) continue;
+      const last = merged[merged.length - 1];
+      if (last && last.kind === s.kind) last.durH += durH;
+      else merged.push({ kind: s.kind, durH });
+    }
+
+    maxSegs = Math.max(maxSegs, merged.length);
+    dayRows.push({ label, merged });
+  }
+
+  // 3) DataTable: day + (ONi, OFFi, UNKi, FUTi) * maxSegs
+  const dt = Charts.newDataTable();
+  dt.addColumn(Charts.ColumnType.STRING, 'day');
+  for (let i = 1; i <= maxSegs; i++) {
+    dt.addColumn(Charts.ColumnType.NUMBER, `ON${i}`);
+    dt.addColumn(Charts.ColumnType.NUMBER, `OFF${i}`);
+    dt.addColumn(Charts.ColumnType.NUMBER, `UNK${i}`);
+    dt.addColumn(Charts.ColumnType.NUMBER, `FUT${i}`);
+  }
+
+  for (const item of dayRows) {
+    const row = [item.label];
+    for (let i = 0; i < maxSegs; i++) {
+      const seg = item.merged[i];
+      if (!seg) {
+        row.push(0,0,0,0);
+      } else if (seg.kind === 'ON') {
+        row.push(seg.durH, 0, 0, 0);
+      } else if (seg.kind === 'OFF') {
+        row.push(0, seg.durH, 0, 0);
+      } else if (seg.kind === 'UNK') {
+        row.push(0, 0, seg.durH, 0);
+      } else { // FUT
+        row.push(0, 0, 0, seg.durH);
+      }
+    }
+    dt.addRow(row);
+  }
+
+  // colors per column
+  const colors = [];
+  for (let i = 1; i <= maxSegs; i++) {
+    colors.push(GREEN, RED, GREY, WHITE);
+  }
+
+  const height = 170 + dayRows.length * 60;
+
+  const b = Charts.newBarChart()
+    .setDataTable(dt)
+    .setStacked()
+    .setDimensions(1400, height)
+    .setTitle(title)
+    .setColors(colors);
+
+  if (typeof b.setOption === 'function') {
+    b.setOption('legend', { position: 'none' });
+    b.setOption('hAxis', { viewWindow: { min: 0, max: 24 }, ticks: [0,4,8,12,16,20,24] });
+    b.setOption('chartArea', { left: 160, top: 60, width: '75%', height: '70%' });
+    b.setOption('bar', { groupWidth: '70%' });
+  }
+
+  return b.build().getAs('image/png').setName('power_week.png');
 }
 
 function telegramSendPhoto_(blob, caption) {
@@ -314,7 +512,29 @@ function fmtDur_(ms) {
   if (d > 0) return `${d}д ${hh}г ${mm}хв`;
   return `${hh}г ${mm}хв`;
 }
+
 ```
+
+appsscript.json
+'''
+{
+  "timeZone": "Europe/Kyiv",
+  "dependencies": {},
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8",
+  "webapp": {
+    "executeAs": "USER_DEPLOYING",
+    "access": "ANYONE_ANONYMOUS"
+  },
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/script.external_request",
+    "https://www.googleapis.com/auth/script.storage"
+  ]
+}
+'''
 4) В Apps Script: Project Settings → Script properties:
 
 - TG_TOKEN = токен бота
