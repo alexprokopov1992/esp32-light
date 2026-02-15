@@ -477,10 +477,12 @@ static esp_err_t gsheets_post_event(const char *state, int64_t epoch_s, const ch
 // Daily 04:30 Kyiv: call
 //   {gs_url}?action=weekly_report&secret={secret}
 static esp_err_t gsheets_get_weekly_report(void) {
-    if (!g_cfg.gs_enabled || g_cfg.gs_url[0] == 0) return ESP_OK;
+    if (!g_cfg.gs_enabled || g_cfg.gs_url[0] == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (g_cfg.gs_secret[0] == 0) {
         ESP_LOGW(TAG, "GSheets weekly_report skipped: secret is empty");
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     char sec_enc[64 * 3 + 1];
