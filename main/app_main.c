@@ -379,11 +379,11 @@ static uint32_t yyyymmdd_local(time_t t) {
     return (y * 10000U) + (m * 100U) + d;
 }
 
-static time_t next_local_time_0430(time_t now) {
+static time_t next_local_time_0001(time_t now) {
     struct tm tmv;
     localtime_r(&now, &tmv);
-    tmv.tm_hour = 4;
-    tmv.tm_min  = 30;
+    tmv.tm_hour = 0;
+    tmv.tm_min  = 1;
     tmv.tm_sec  = 0;
     time_t t = mktime(&tmv);
     if (t <= now) {
@@ -393,10 +393,10 @@ static time_t next_local_time_0430(time_t now) {
     return t;
 }
 
-static bool is_after_0430_local(time_t now) {
+static bool is_after_0001_local(time_t now) {
     struct tm tmv;
     localtime_r(&now, &tmv);
-    return (tmv.tm_hour > 4) || (tmv.tm_hour == 4 && tmv.tm_min >= 30);
+    return (tmv.tm_hour > 0) || (tmv.tm_hour == 0 && tmv.tm_min >= 1);
 }
 
 static void url_encode(const char *in, char *out, size_t out_sz) {
@@ -541,7 +541,7 @@ static void weekly_report_task(void *arg) {
         uint32_t today = yyyymmdd_local(now);
 
         // If it's already >= 04:30 and not sent today -> try to send (and retry until success)
-        if (is_after_0430_local(now) && last_day != today) {
+        if (is_after_0001_local(now) && last_day != today) {
             // Wait for WiFi if needed
             EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
             if (!(bits & WIFI_CONNECTED_BIT)) {
@@ -556,7 +556,7 @@ static void weekly_report_task(void *arg) {
                     last_day = today;
                     save_u32(KEY_LAST_WEEKLY_DATE, last_day);
                     // Sleep until next day 04:30
-                    time_t nxt = next_local_time_0430(time(NULL));
+                    time_t nxt = next_local_time_0001(time(NULL));
                     int64_t delta_ms = (int64_t)(nxt - time(NULL)) * 1000LL;
                     if (delta_ms < 1000) delta_ms = 1000;
                     sleep_ms_chunked(delta_ms);
@@ -570,7 +570,7 @@ static void weekly_report_task(void *arg) {
         }
 
         // It's before 04:30 OR already sent today -> sleep until next 04:30
-        time_t nxt = next_local_time_0430(now);
+        time_t nxt = next_local_time_0001(now);
         int64_t delta_ms = (int64_t)(nxt - now) * 1000LL;
         if (delta_ms < 1000) delta_ms = 1000;
         sleep_ms_chunked(delta_ms);
