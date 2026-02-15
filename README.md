@@ -67,6 +67,36 @@ function checkSecret_(secret) {
   return String(secret || '') === String(s);
 }
 
+function parseDurationSec_(s) {
+  const str = String(s || '').toLowerCase();
+  let total = 0;
+
+  const re = /(\d+)\s*(д|дн|год|г|h|хв|мин|min|m|сек|с|sec|s)/g;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const n = parseInt(m[1], 10);
+    const u = m[2];
+
+    if (u === 'д' || u === 'дн') total += n * 86400;
+    else if (u === 'год' || u === 'г' || u === 'h') total += n * 3600;
+    else if (u === 'хв' || u === 'мин' || u === 'min' || u === 'm') total += n * 60;
+    else total += n; // сек
+  }
+
+  // якщо просто число
+  if (total === 0) {
+    const n = Number(str);
+    if (isFinite(n) && n > 0) total = Math.floor(n);
+  }
+  return total;
+}
+
+function oppositeState_(s) {
+  if (s === 'ON') return 'OFF';
+  if (s === 'OFF') return 'ON';
+  return 'UNK';
+}
+
 function normalizeState_(s) {
   const v = String(s || '').toUpperCase();
   if (v === 'ON' || v === '1' || v === 'TRUE') return 'ON';
@@ -106,19 +136,19 @@ function getWeekStartMonday_(d) {
 function sendWeeklyReport_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const generatedAt = new Date();               // час генерації
-  const start = getWeekStartMonday_(generatedAt);
-  const end = new Date(start); end.setDate(end.getDate() + 7);
+  const generatedAt = new Date();
+  const weekStart = getWeekStartMonday_(generatedAt);
+  const weekEnd = new Date(weekStart); weekEnd.setDate(weekEnd.getDate() + 7);
 
-  // Дані беремо ТІЛЬКИ до generatedAt (щоб майбутнє було біле)
-  const dataEnd = new Date(Math.min(end.getTime(), generatedAt.getTime()));
+  const dataEnd = new Date(Math.min(weekEnd.getTime(), generatedAt.getTime()));
 
-  const events = loadEvents_(ss, start, dataEnd);
-  const built = buildSegments_(events, start, dataEnd);
+  const events = loadEvents_(ss, weekStart, dataEnd);
+  const built = buildSegments_(events, weekStart, dataEnd);
 
-  const chartBlob = buildChartPng_(ss, built.rowsForChart, start, end, generatedAt);
+  const chartBlob = buildChartPng_(ss, built.rowsForChart, weekStart, weekEnd, generatedAt);
   telegramSendPhoto_(chartBlob, built.caption);
 }
+
 
 function loadEvents_(ss, start, end) {
   const sh = ss.getSheetByName(CFG.LOG_SHEET);
@@ -130,6 +160,8 @@ function loadEvents_(ss, start, end) {
   const colTs = hdr.indexOf('ts');
   const colDev = hdr.indexOf('device');
   const colState = hdr.indexOf('state');
+  const colDur = hdr.indexOf('duration');
+
   if (colTs < 0 || colState < 0) return [];
 
   let lastBefore = null;
@@ -141,25 +173,27 @@ function loadEvents_(ss, start, end) {
     const dev = (colDev >= 0) ? String(r[colDev] || '') : '';
     if (CFG.DEVICE_FILTER && dev !== CFG.DEVICE_FILTER) continue;
 
-    // parse time
     const tsCell = r[colTs];
     let t = null;
     if (tsCell instanceof Date) t = tsCell;
     else {
       const n = Number(tsCell);
       if (!isFinite(n) || n <= 0) continue;
-      t = (n > 1e12) ? new Date(n) : new Date(n * 1000); // ms or sec
+      t = (n > 1e12) ? new Date(n) : new Date(n * 1000);
     }
 
     const state = normalizeState_(r[colState]);
+    const durSec = (colDur >= 0) ? parseDurationSec_(r[colDur]) : 0;
+
+    const rec = { t, state, durSec };
 
     if (t < start) {
-      if (!lastBefore || t > lastBefore.t) lastBefore = { t, state };
+      if (!lastBefore || t > lastBefore.t) lastBefore = rec;
       continue;
     }
     if (t >= end) continue;
 
-    out.push({ t, state });
+    out.push(rec);
   }
 
   if (lastBefore) out.unshift(lastBefore);
@@ -167,10 +201,12 @@ function loadEvents_(ss, start, end) {
   return out;
 }
 
+
 // Строим интервалы ON/OFF и готовим строки для TIMELINE чарта так,
 // чтобы ось была 0..24 (все дни “ложим” на одну базовую дату, а дни различаем rowLabel)
-function buildSegments_(events, start, end) {
+function buildSegments_(events, start, endWindow) {
   const BASE = new Date(2000, 0, 1, 0, 0, 0, 0);
+  const TOL = 2; // сек допуск
 
   function dayLabel_(d) {
     const wd = ['НД','ПН','ВТ','СР','ЧТ','ПТ','СБ'][d.getDay()];
@@ -179,70 +215,90 @@ function buildSegments_(events, start, end) {
     return `${wd} (${dd}.${mm})`;
   }
 
-  // endAtDayEnd=true -> 23:59:59.999 (НЕ 02.01.2000 00:00)
   function toBaseTime_(d, endAtDayEnd) {
     const b = new Date(BASE);
-    if (endAtDayEnd) {
-      b.setHours(23, 59, 59, 0);
-    } else {
-      b.setHours(d.getHours(), d.getMinutes(), d.getSeconds(), 0);
-    }
+    if (endAtDayEnd) b.setHours(23, 59, 59, 0);
+    else b.setHours(d.getHours(), d.getMinutes(), d.getSeconds(), 0);
     return b;
   }
 
+  // стан на start
   let curState = 'UNK';
+  let prevEvent = null;
   for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i].t < start) { curState = events[i].state; break; }
+    if (events[i].t < start) { curState = events[i].state; prevEvent = events[i]; break; }
   }
-  if (curState === 'UNK') curState = 'OFF';
 
-  const inWindow = events.filter(e => e.t >= start && e.t < end);
-
+  const inWindow = events.filter(e => e.t >= start && e.t < endWindow);
   const raw = [];
   let curT = new Date(start);
+
   for (const ev of inWindow) {
-    if (ev.t > curT) raw.push({ state: curState, a: new Date(curT), b: new Date(ev.t) });
+    if (ev.t <= curT) { prevEvent = ev; curState = ev.state; curT = new Date(ev.t); continue; }
+
+    const prevStateFromEv = oppositeState_(ev.state);
+
+    if (ev.durSec > 0) {
+      const knownFrom = new Date(ev.t.getTime() - ev.durSec * 1000);
+
+      const deltaSec = prevEvent ? Math.round((ev.t.getTime() - prevEvent.t.getTime()) / 1000) : null;
+      const okDelta = (deltaSec !== null) && (Math.abs(deltaSec - ev.durSec) <= TOL);
+      const okState = (prevStateFromEv === 'UNK') || (curState === prevStateFromEv);
+
+      if (okDelta && okState) {
+        // нормальний випадок: все сходиться
+        raw.push({ state: curState, a: new Date(curT), b: new Date(ev.t) });
+      } else {
+        // НЕ сходиться: частину робимо UNK, але останній durSec перед ev.t можемо показати як prevStateFromEv
+        const kFrom = (knownFrom > curT) ? knownFrom : curT;
+
+        if (kFrom > curT) raw.push({ state: 'UNK', a: new Date(curT), b: new Date(kFrom) });
+        if (ev.t > kFrom) raw.push({ state: prevStateFromEv, a: new Date(kFrom), b: new Date(ev.t) });
+      }
+    } else {
+      // duration немає -> вважаємо, що проміжок невідомий
+      raw.push({ state: 'UNK', a: new Date(curT), b: new Date(ev.t) });
+    }
+
     curState = ev.state;
     curT = new Date(ev.t);
+    prevEvent = ev;
   }
-  if (curT < end) raw.push({ state: curState, a: new Date(curT), b: new Date(end) });
 
+  if (curT < endWindow) raw.push({ state: curState, a: new Date(curT), b: new Date(endWindow) });
+
+  // split by days -> rowsForChart
   const rowsForChart = [];
   const ONE_DAY = 24 * 3600 * 1000;
 
   for (const seg of raw) {
     let a = seg.a;
     const b = seg.b;
+
     while (a < b) {
       const dayStart = new Date(a); dayStart.setHours(0,0,0,0);
       const dayEnd = new Date(dayStart.getTime() + ONE_DAY);
       const partEnd = new Date(Math.min(b.getTime(), dayEnd.getTime()));
 
-      const label = dayLabel_(dayStart);
-
-      const endAtDayEnd =
-        partEnd.getTime() === dayEnd.getTime() && partEnd.getTime() > a.getTime();
+      const endAtDayEnd = (partEnd.getTime() === dayEnd.getTime() && partEnd.getTime() > a.getTime());
 
       const s = toBaseTime_(a, false);
       const e = toBaseTime_(partEnd, endAtDayEnd);
 
-      // ЖЁСТКИЙ CLAMP: диапазон строго внутри 01.01.2000 00:00:00.000 .. 01.01.2000 23:59:59.999
       const base0 = BASE.getTime();
-      const baseEnd = base0 + 24 * 3600 * 1000 - 1000; // последний миллисекунд дня
+      const baseEnd = base0 + 24 * 3600 * 1000 - 1000;
 
       let sT = s.getTime();
       let eT = e.getTime();
-
-      // если вдруг получилось 02.01.2000 00:00:00 -> прижимаем к 23:59:59.999
       if (sT < base0) sT = base0;
       if (eT > baseEnd) eT = baseEnd;
 
-      // защита от нулевых/битых интервалов
       if (eT > sT) {
         rowsForChart.push([
-          label,
+          dayLabel_(dayStart),
           (seg.state === 'ON') ? CFG.LABEL_ON :
-          (seg.state === 'OFF') ? CFG.LABEL_OFF : CFG.LABEL_UNK,
+          (seg.state === 'OFF') ? CFG.LABEL_OFF :
+          CFG.LABEL_UNK,
           new Date(sT),
           new Date(eT),
         ]);
@@ -252,26 +308,29 @@ function buildSegments_(events, start, end) {
     }
   }
 
-  // ... твоя статистика/caption без изменений ...
-  // return { rowsForChart, caption };
-
-  let onMs = 0, offMs = 0, outages = 0;
+  // статистика (UNK не рахуємо в on/off)
+  let onMs = 0, offMs = 0, unkMs = 0, outages = 0;
   let prev = null;
   for (const seg of raw) {
     const ms = seg.b.getTime() - seg.a.getTime();
-    if (seg.state === 'ON') onMs += ms; else offMs += ms;
+    if (seg.state === 'ON') onMs += ms;
+    else if (seg.state === 'OFF') offMs += ms;
+    else unkMs += ms;
+
     if (prev && prev.state === 'ON' && seg.state === 'OFF') outages++;
     prev = seg;
   }
 
   const caption =
-    `Звіт за 7 діб (${formatDate_(start)}–${formatDate_(new Date(end.getTime()-1))})\n` +
+    `Звіт (${formatDate_(start)}–${formatDate_(new Date(endWindow.getTime()-1))})\n` +
     `Світло було: ${fmtDur_(onMs)}\n` +
     `Світла не було: ${fmtDur_(offMs)}\n` +
+    `Невідомо: ${fmtDur_(unkMs)}\n` +
     `Вимикали: ${outages} раз(и)`;
 
   return { rowsForChart, caption };
 }
+
 
 function buildChartPng_(ss, rows, start, end, generatedAt) {
   const sh = ss.getSheetByName(CFG.REPORT_SHEET) || ss.insertSheet(CFG.REPORT_SHEET);
@@ -512,6 +571,7 @@ function fmtDur_(ms) {
   if (d > 0) return `${d}д ${hh}г ${mm}хв`;
   return `${hh}г ${mm}хв`;
 }
+
 
 ```
 
