@@ -78,6 +78,9 @@ static const char *TAG = "power_pinger";
 #define KEY_GS_URL             "gs_url"      // string: Apps Script WebApp URL (optional)
 #define KEY_GS_SECRET          "gs_sec"      // string: simple shared secret (optional)
 #define KEY_DEVICE_ID          "dev_id"      // string: device name/id (optional)
+
+// YYYYMMDD of last successful daily report request (Kyiv local time)
+#define KEY_LAST_WEEKLY_DATE   "wrep_day"    // u32
 /* ---------- WiFi events ---------- */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -254,6 +257,25 @@ static void save_i64(const char *key, int64_t val) {
     }
 }
 
+static uint32_t load_u32(const char *key, uint32_t def_val) {
+    nvs_handle_t h;
+    uint32_t v = def_val;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, key, &v);
+        nvs_close(h);
+    }
+    return v;
+}
+
+static void save_u32(const char *key, uint32_t val) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, key, val);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* ---------- Telegram ---------- */
 static esp_err_t tg_send_message(const char *token, const char *chat_id, const char *text) {
     char url[256];
@@ -348,6 +370,59 @@ static void format_iso_local(int64_t epoch_s, char *out, size_t out_sz) {
     strftime(out, out_sz, "%Y-%m-%d %H:%M:%S", &tmv);
 }
 
+static uint32_t yyyymmdd_local(time_t t) {
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    uint32_t y = (uint32_t)(tmv.tm_year + 1900);
+    uint32_t m = (uint32_t)(tmv.tm_mon + 1);
+    uint32_t d = (uint32_t)(tmv.tm_mday);
+    return (y * 10000U) + (m * 100U) + d;
+}
+
+static time_t next_local_time_0430(time_t now) {
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    tmv.tm_hour = 4;
+    tmv.tm_min  = 30;
+    tmv.tm_sec  = 0;
+    time_t t = mktime(&tmv);
+    if (t <= now) {
+        tmv.tm_mday += 1;
+        t = mktime(&tmv);
+    }
+    return t;
+}
+
+static bool is_after_0430_local(time_t now) {
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    return (tmv.tm_hour > 4) || (tmv.tm_hour == 4 && tmv.tm_min >= 30);
+}
+
+static void url_encode(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = 0;
+    if (!in) return;
+
+    static const char hex[] = "0123456789ABCDEF";
+    size_t oi = 0;
+    for (size_t i = 0; in[i] && (oi + 1) < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[oi++] = (char)c;
+        } else if (c == ' ') {
+            out[oi++] = '+';
+        } else {
+            if (oi + 3 >= out_sz) break;
+            out[oi++] = '%';
+            out[oi++] = hex[(c >> 4) & 0xF];
+            out[oi++] = hex[c & 0xF];
+        }
+    }
+    out[oi] = 0;
+}
+
 static esp_err_t gsheets_post_event(const char *state, int64_t epoch_s, const char *duration_str) {
     if (!g_cfg.gs_enabled || g_cfg.gs_url[0] == 0) return ESP_OK;
 
@@ -397,6 +472,109 @@ static esp_err_t gsheets_post_event(const char *state, int64_t epoch_s, const ch
 
     esp_http_client_cleanup(client);
     return err;
+}
+
+// Daily 04:30 Kyiv: call
+//   {gs_url}?action=weekly_report&secret={secret}
+static esp_err_t gsheets_get_weekly_report(void) {
+    if (!g_cfg.gs_enabled || g_cfg.gs_url[0] == 0) return ESP_OK;
+    if (g_cfg.gs_secret[0] == 0) {
+        ESP_LOGW(TAG, "GSheets weekly_report skipped: secret is empty");
+        return ESP_OK;
+    }
+
+    char sec_enc[64 * 3 + 1];
+    url_encode(g_cfg.gs_secret, sec_enc, sizeof(sec_enc));
+
+    const bool has_q = (strchr(g_cfg.gs_url, '?') != NULL);
+    char url[512];
+    snprintf(url, sizeof(url), "%s%caction=weekly_report&secret=%s", g_cfg.gs_url, has_q ? '&' : '?', sec_enc);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_FAIL;
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "GSheets weekly_report HTTP %d", code);
+        // Accept 2xx and simple redirects
+        if (!((code >= 200 && code < 300) || (code >= 300 && code < 400))) err = ESP_FAIL;
+    } else {
+        ESP_LOGW(TAG, "GSheets weekly_report failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+static void sleep_ms_chunked(int64_t ms) {
+    // avoid very large delays in one call
+    const int64_t step_ms = 60LL * 60LL * 1000LL; // 1 hour
+    while (ms > 0) {
+        int64_t chunk = (ms > step_ms) ? step_ms : ms;
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)chunk));
+        ms -= chunk;
+    }
+}
+
+static void weekly_report_task(void *arg) {
+    (void)arg;
+    // Read last successful sent day from NVS
+    uint32_t last_day = load_u32(KEY_LAST_WEEKLY_DATE, 0);
+
+    while (1) {
+        time_t now = time(NULL);
+
+        // If time is not synced yet, wait a bit
+        if (now < 1700000000) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        uint32_t today = yyyymmdd_local(now);
+
+        // If it's already >= 04:30 and not sent today -> try to send (and retry until success)
+        if (is_after_0430_local(now) && last_day != today) {
+            // Wait for WiFi if needed
+            EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+            if (!(bits & WIFI_CONNECTED_BIT)) {
+                (void)xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE,
+                                         pdMS_TO_TICKS(10 * 60 * 1000));
+            }
+
+            bits = xEventGroupGetBits(s_wifi_event_group);
+            if (bits & WIFI_CONNECTED_BIT) {
+                esp_err_t e = gsheets_get_weekly_report();
+                if (e == ESP_OK) {
+                    last_day = today;
+                    save_u32(KEY_LAST_WEEKLY_DATE, last_day);
+                    // Sleep until next day 04:30
+                    time_t nxt = next_local_time_0430(time(NULL));
+                    int64_t delta_ms = (int64_t)(nxt - time(NULL)) * 1000LL;
+                    if (delta_ms < 1000) delta_ms = 1000;
+                    sleep_ms_chunked(delta_ms);
+                    continue;
+                }
+            }
+
+            // Not connected or failed -> retry every 10 minutes until success or day changes
+            vTaskDelay(pdMS_TO_TICKS(10 * 60 * 1000));
+            continue;
+        }
+
+        // It's before 04:30 OR already sent today -> sleep until next 04:30
+        time_t nxt = next_local_time_0430(now);
+        int64_t delta_ms = (int64_t)(nxt - now) * 1000LL;
+        if (delta_ms < 1000) delta_ms = 1000;
+        sleep_ms_chunked(delta_ms);
+    }
 }
 
 
@@ -999,4 +1177,6 @@ void app_main(void) {
     if (load_i64(KEY_LAST_OFF_TIME, -1) < 0) save_i64(KEY_LAST_OFF_TIME, t);
 
     xTaskCreate(main_logic_task, "main_logic", 8192, NULL, 5, NULL);
+    // Daily report trigger to Apps Script at 04:30 Kyiv
+    xTaskCreate(weekly_report_task, "gs_weekly", 6144, NULL, 4, NULL);
 }
