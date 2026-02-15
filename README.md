@@ -603,6 +603,6 @@ appsscript.json
 
 - GS_SECRET = тот же секрет, что в ESP32 (gs_sec)
 
-5) Deploy → New deployment → Web app. Укажи “Execute as me” (чтобы скрипт мог писать в таблицу) и доступ “Anyone…” по ситуации.
+5) Deploy → New deployment → Web app. Укажи “Execute as me” (чтобы скрипт мог писать в таблицу) и доступ “Anyone”.
 
 6) Скопируй URL вида https://script.google.com/macros/s/.../exec — это и будет вебхук.
