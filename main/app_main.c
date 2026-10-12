@@ -79,6 +79,8 @@ static const char *TAG = "power_pinger";
 #define KEY_LAST_STATUS         "last_stat"    // u8: 1=on, 0=off, 0xFF=unknown
 #define KEY_LAST_OFF_TIME       "last_off"     // i64 epoch
 #define KEY_LAST_ON_TIME        "last_on"      // i64 epoch
+#define KEY_WEEKLY_REPORT_DAY   "wrep_day"     // u32 YYYYMMDD: last successful Tue-Sun 00:01 report
+#define KEY_WEEKLY_REPORT_FINAL "wrep_final"   // u32 YYYYMMDD: last successful Sunday 23:59 final report
 
 /* ---------- WiFi events ---------- */
 #define WIFI_CONNECTED_BIT BIT0
@@ -419,6 +421,25 @@ static void save_i64(const char *key, int64_t val) {
     }
 }
 
+static uint32_t load_u32(const char *key, uint32_t def_val) {
+    nvs_handle_t h;
+    uint32_t v = def_val;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u32(h, key, &v) != ESP_OK) v = def_val;
+        nvs_close(h);
+    }
+    return v;
+}
+
+static bool save_u32(const char *key, uint32_t val) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u32(h, key, val);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err == ESP_OK;
+}
+
 /* ---------- Google Sheets / Apps Script ---------- */
 static bool gsheets_configured(void) {
     return g_cfg.gs_url[0] != 0 && g_cfg.gs_secret[0] != 0 && g_cfg.device_id[0] != 0;
@@ -515,6 +536,197 @@ static esp_err_t gsheets_post_event(const char *state, int64_t ts, int64_t durat
 
     esp_http_client_cleanup(client);
     return err;
+}
+
+/*
+ * Ask the existing Google Apps Script to generate the current week graph and
+ * send the PNG to Telegram. The Apps Script owns chart generation/sendPhoto;
+ * ESP32 only triggers action=weekly_report.
+ */
+static void url_encode_query_value(const char *src, char *dst, size_t dst_sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (!dst || dst_sz == 0) return;
+    size_t oi = 0;
+    for (size_t i = 0; src && src[i] != 0 && oi + 1 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        bool safe = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                     c == '.' || c == '~');
+        if (safe) {
+            dst[oi++] = (char)c;
+        } else {
+            if (oi + 3 >= dst_sz) break;
+            dst[oi++] = '%';
+            dst[oi++] = hex[(c >> 4) & 0x0F];
+            dst[oi++] = hex[c & 0x0F];
+        }
+    }
+    dst[oi] = 0;
+}
+
+static esp_err_t gsheets_get_weekly_report(const char *slot_name) {
+    if (!gsheets_configured()) {
+        ESP_LOGW(TAG, "Google Sheets report is not configured; slot=%s",
+                 slot_name ? slot_name : "?");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char secret_enc[384];
+    url_encode_query_value(g_cfg.gs_secret, secret_enc, sizeof(secret_enc));
+
+    char url[768];
+    const char sep = strchr(g_cfg.gs_url, '?') ? '&' : '?';
+    int n = snprintf(url, sizeof(url), "%s%caction=weekly_report&secret=%s",
+                     g_cfg.gs_url, sep, secret_enc);
+    if (n < 0 || n >= (int)sizeof(url)) {
+        ESP_LOGE(TAG, "Weekly report URL too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 30000,
+        // Apps Script ContentService commonly responds with 302/303 after the script
+        // has already executed. Avoid following the redirect and treat 2xx/3xx as success.
+        .disable_auto_redirect = true,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_FAIL;
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "GSheets weekly report HTTP %d slot=%s",
+                 code, slot_name ? slot_name : "?");
+        if (code < 200 || code >= 400) err = ESP_FAIL;
+    } else {
+        ESP_LOGW(TAG, "GSheets weekly report failed slot=%s: %s",
+                 slot_name ? slot_name : "?", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+static uint32_t local_yyyymmdd(const struct tm *tm_local) {
+    if (!tm_local) return 0;
+    return (uint32_t)(tm_local->tm_year + 1900) * 10000u +
+           (uint32_t)(tm_local->tm_mon + 1) * 100u +
+           (uint32_t)tm_local->tm_mday;
+}
+
+static bool report_daily_slot_due(const struct tm *tm_local) {
+    if (!tm_local) return false;
+
+    // tm_wday: 0=Sunday, 1=Monday, 2=Tuesday, ... 6=Saturday.
+    // Monday has no scheduled report. Tue-Sun become due after 00:01.
+    // At Sunday 23:59 the final slot takes precedence; do not send a missed
+    // 00:01 snapshot immediately before the final snapshot.
+    if (tm_local->tm_wday == 1) return false;
+    if (tm_local->tm_wday == 0 && tm_local->tm_hour == 23 && tm_local->tm_min == 59) {
+        return false;
+    }
+    return (tm_local->tm_hour > 0) ||
+           (tm_local->tm_hour == 0 && tm_local->tm_min >= 1);
+}
+
+static bool report_sunday_final_slot_due(const struct tm *tm_local) {
+    if (!tm_local) return false;
+    return tm_local->tm_wday == 0 &&
+           tm_local->tm_hour == 23 &&
+           tm_local->tm_min == 59;
+}
+
+/*
+ * Schedule in Europe/Kyiv local time:
+ *   Monday    - no regular report
+ *   Tue-Sun   - 00:01, once per local date
+ *   Sunday    - additionally 23:59 final snapshot
+ *
+ * Daily report failures are retried every 10 minutes while the slot remains due.
+ * Sunday 23:59 is special: retries are every 10 seconds until midnight so that a
+ * retry cannot accidentally generate the next week's graph on Monday.
+ */
+static void weekly_report_task(void *arg) {
+    (void)arg;
+
+    ESP_LOGI(TAG,
+             "Weekly graph scheduler started: Tue-Sun 00:01; Sun 23:59; timezone=Europe/Kyiv");
+
+    int64_t daily_retry_after_ms = 0;
+    int64_t final_retry_after_ms = 0;
+    uint32_t daily_retry_date = 0;
+    uint32_t final_retry_date = 0;
+    uint32_t sent_day = load_u32(KEY_WEEKLY_REPORT_DAY, 0);
+    uint32_t sent_final = load_u32(KEY_WEEKLY_REPORT_FINAL, 0);
+
+    while (1) {
+        EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+        bool wifi_ok = (bits & WIFI_CONNECTED_BIT) != 0;
+
+        time_t now = time(NULL);
+        if (wifi_ok && now > 1700000000) {
+            struct tm tm_local;
+            localtime_r(&now, &tm_local);
+            uint32_t today = local_yyyymmdd(&tm_local);
+            int64_t mono_ms = now_ms();
+
+            if (daily_retry_date != today) {
+                daily_retry_date = today;
+                daily_retry_after_ms = 0;
+            }
+            if (final_retry_date != today) {
+                final_retry_date = today;
+                final_retry_after_ms = 0;
+            }
+
+            if (report_daily_slot_due(&tm_local)) {
+                if (sent_day != today && mono_ms >= daily_retry_after_ms) {
+                    ESP_LOGI(TAG, "Weekly graph daily slot due: %08" PRIu32, today);
+                    esp_err_t err = gsheets_get_weekly_report("daily-00:01");
+                    if (err == ESP_OK) {
+                        // Mark in RAM even if NVS commit fails, so one successful HTTP call
+                        // cannot cause duplicate Telegram graphs every 5 seconds this boot.
+                        sent_day = today;
+                        if (save_u32(KEY_WEEKLY_REPORT_DAY, today)) {
+                            ESP_LOGI(TAG, "Weekly graph daily slot marked sent: %08" PRIu32, today);
+                        } else {
+                            ESP_LOGW(TAG, "Weekly graph sent, but failed to persist wrep_day");
+                        }
+                        daily_retry_after_ms = 0;
+                    } else {
+                        daily_retry_after_ms = mono_ms + (10 * 60 * 1000LL);
+                        ESP_LOGW(TAG, "Weekly graph daily slot retry in 10 minutes");
+                    }
+                }
+            }
+
+            if (report_sunday_final_slot_due(&tm_local)) {
+                if (sent_final != today && mono_ms >= final_retry_after_ms) {
+                    ESP_LOGI(TAG, "Weekly graph Sunday final slot due: %08" PRIu32, today);
+                    esp_err_t err = gsheets_get_weekly_report("sunday-23:59");
+                    if (err == ESP_OK) {
+                        sent_final = today;
+                        if (save_u32(KEY_WEEKLY_REPORT_FINAL, today)) {
+                            ESP_LOGI(TAG, "Weekly graph Sunday final slot marked sent: %08" PRIu32, today);
+                        } else {
+                            ESP_LOGW(TAG, "Sunday final graph sent, but failed to persist wrep_final");
+                        }
+                        final_retry_after_ms = 0;
+                    } else {
+                        final_retry_after_ms = mono_ms + 10000LL;
+                        ESP_LOGW(TAG, "Sunday final graph retry in 10 seconds (until midnight)");
+                    }
+                }
+            }
+        }
+
+        // Fine enough to hit 23:59 promptly without burdening the ESP32.
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
 /* ---------- Telegram ---------- */
@@ -1300,4 +1512,7 @@ void app_main(void) {
     if (load_i64(KEY_LAST_OFF_TIME, -1) < 0) save_i64(KEY_LAST_OFF_TIME, t);
 
     xTaskCreate(main_logic_task, "main_logic", 8192, NULL, 5, NULL);
+    if (gsheets_configured()) {
+        xTaskCreate(weekly_report_task, "gs_weekly", 6144, NULL, 4, NULL);
+    }
 }
