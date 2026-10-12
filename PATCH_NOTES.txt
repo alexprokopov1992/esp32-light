@@ -1,0 +1,11 @@
+PowerPinger patch
+
+- Restored direct Google Apps Script / Google Sheets event logging.
+- NVS keys: gs_url, gs_sec, dev_id.
+- Sends JSON fields: device, state, ts, iso, duration, secret on confirmed ON/OFF transitions.
+- Keeps Google settings optional and preserves stored Google values if setup fields are left blank.
+- Keeps 3 ping targets and 120 s no-success OFF confirmation.
+- Keeps NVS dump.
+- HTTP setup server limits increased: request headers 4096 bytes, URI 1024 bytes.
+- Setup POST buffer increased to 2048 bytes.
+- Apps Script redirects are not auto-followed as POST; HTTP 2xx/3xx is treated as accepted.

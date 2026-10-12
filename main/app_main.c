@@ -73,6 +73,9 @@ static const char *TAG = "power_pinger";
 #define KEY_PING_IP             "ping_ip"
 #define KEY_PING_IP2            "ping_ip2"
 #define KEY_PING_IP3            "ping_ip3"
+#define KEY_GS_URL              "gs_url"      // Google Apps Script Web App /exec URL
+#define KEY_GS_SECRET           "gs_sec"      // shared secret for Apps Script
+#define KEY_DEVICE_ID           "dev_id"      // device identifier written to the sheet
 #define KEY_LAST_STATUS         "last_stat"    // u8: 1=on, 0=off, 0xFF=unknown
 #define KEY_LAST_OFF_TIME       "last_off"     // i64 epoch
 #define KEY_LAST_ON_TIME        "last_on"      // i64 epoch
@@ -92,6 +95,9 @@ typedef struct {
     char ping_ip[16];  // primary, required
     char ping_ip2[16]; // optional
     char ping_ip3[16]; // optional
+    char gs_url[256];    // optional Google Apps Script /exec URL
+    char gs_secret[128]; // optional shared secret
+    char device_id[64];  // optional device id used by the sheet/report
     bool valid;
 } app_cfg_t;
 
@@ -342,6 +348,11 @@ static bool load_cfg_from_nvs(app_cfg_t *cfg) {
     // Optional targets: missing keys are valid for devices configured by older firmware.
     (void)nvs_get_str_safe(h, KEY_PING_IP2, cfg->ping_ip2, sizeof(cfg->ping_ip2));
     (void)nvs_get_str_safe(h, KEY_PING_IP3, cfg->ping_ip3, sizeof(cfg->ping_ip3));
+
+    // Google Sheets integration is optional. Existing devices keep working even if these keys are absent.
+    (void)nvs_get_str_safe(h, KEY_GS_URL, cfg->gs_url, sizeof(cfg->gs_url));
+    (void)nvs_get_str_safe(h, KEY_GS_SECRET, cfg->gs_secret, sizeof(cfg->gs_secret));
+    (void)nvs_get_str_safe(h, KEY_DEVICE_ID, cfg->device_id, sizeof(cfg->device_id));
     nvs_close(h);
 
     cfg->valid = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK && e5 == ESP_OK &&
@@ -362,6 +373,9 @@ static bool save_cfg_to_nvs(const app_cfg_t *cfg) {
     err |= nvs_set_str(h, KEY_PING_IP, cfg->ping_ip);
     err |= nvs_set_str(h, KEY_PING_IP2, cfg->ping_ip2);
     err |= nvs_set_str(h, KEY_PING_IP3, cfg->ping_ip3);
+    err |= nvs_set_str(h, KEY_GS_URL, cfg->gs_url);
+    err |= nvs_set_str(h, KEY_GS_SECRET, cfg->gs_secret);
+    err |= nvs_set_str(h, KEY_DEVICE_ID, cfg->device_id);
     err |= nvs_commit(h);
     nvs_close(h);
     return (err == ESP_OK);
@@ -403,6 +417,104 @@ static void save_i64(const char *key, int64_t val) {
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+/* ---------- Google Sheets / Apps Script ---------- */
+static bool gsheets_configured(void) {
+    return g_cfg.gs_url[0] != 0 && g_cfg.gs_secret[0] != 0 && g_cfg.device_id[0] != 0;
+}
+
+static void json_escape_str(const char *src, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    size_t oi = 0;
+    for (size_t i = 0; src && src[i] != 0 && oi + 1 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        const char *esc = NULL;
+        char tmp[7];
+        switch (c) {
+            case '"': esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\b': esc = "\\b"; break;
+            case '\f': esc = "\\f"; break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    snprintf(tmp, sizeof(tmp), "\\u%04X", (unsigned)c);
+                    esc = tmp;
+                }
+                break;
+        }
+        if (esc) {
+            size_t n = strlen(esc);
+            if (oi + n >= dst_sz) break;
+            memcpy(dst + oi, esc, n);
+            oi += n;
+        } else {
+            dst[oi++] = (char)c;
+        }
+    }
+    dst[oi] = 0;
+}
+
+static esp_err_t gsheets_post_event(const char *state, int64_t ts, int64_t duration_s) {
+    if (!gsheets_configured()) {
+        ESP_LOGW(TAG, "Google Sheets webhook is not configured; event %s not posted", state);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char iso[48] = {0};
+    time_t tt = (time_t)ts;
+    struct tm tm_local;
+    localtime_r(&tt, &tm_local);
+    strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%S%z", &tm_local);
+
+    char dev_esc[128];
+    char secret_esc[256];
+    char iso_esc[96];
+    json_escape_str(g_cfg.device_id, dev_esc, sizeof(dev_esc));
+    json_escape_str(g_cfg.gs_secret, secret_esc, sizeof(secret_esc));
+    json_escape_str(iso, iso_esc, sizeof(iso_esc));
+
+    char body[768];
+    int body_len = snprintf(body, sizeof(body),
+                            "{\"device\":\"%s\",\"state\":\"%s\",\"ts\":%" PRId64
+                            ",\"iso\":\"%s\",\"duration\":%" PRId64 ",\"secret\":\"%s\"}",
+                            dev_esc, state, ts, iso_esc, duration_s, secret_esc);
+    if (body_len < 0 || body_len >= (int)sizeof(body)) {
+        ESP_LOGE(TAG, "GSheets JSON body too large");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = g_cfg.gs_url,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 10000,
+        // Apps Script often returns a 302/303 after doPost(). The row is already handled by
+        // the Web App, so do not auto-follow it as another POST (which can produce HTTP 405).
+        .disable_auto_redirect = true,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_FAIL;
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, body, body_len);
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "GSheets webhook HTTP %d state=%s duration=%" PRId64, code, state, duration_s);
+        // 3xx is normal for Apps Script ContentService responses; doPost has already run.
+        if (code < 200 || code >= 400) err = ESP_FAIL;
+    } else {
+        ESP_LOGW(TAG, "GSheets webhook failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
 }
 
 /* ---------- Telegram ---------- */
@@ -481,6 +593,11 @@ static const char *HTML_FORM =
 "<label>Ping IP 1 (required)</label><input name='ping_ip' placeholder='192.168.1.1' required>"
 "<label>Ping IP 2 (optional)</label><input name='ping_ip2' placeholder='1.1.1.1'>"
 "<label>Ping IP 3 (optional)</label><input name='ping_ip3' placeholder='8.8.8.8'>"
+"<hr><h3>Google Sheets history (optional)</h3>"
+"<p>Leave these fields empty to keep the values already stored in NVS.</p>"
+"<label>Google Apps Script Web App URL (/exec)</label><input name='gs_url' placeholder='https://script.google.com/macros/s/.../exec'>"
+"<label>Google Sheets secret</label><input name='gs_secret' type='password'>"
+"<label>Device ID</label><input name='device_id' placeholder='pinger'>"
 "<button type='submit'>Save & Reboot</button>"
 "</form></body></html>";
 
@@ -531,7 +648,7 @@ static void form_get(const char *body, const char *key, char *out, size_t out_sz
 }
 
 static esp_err_t http_save_post(httpd_req_t *req) {
-    char buf[512];
+    char buf[2048];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(buf)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad content length");
@@ -553,6 +670,22 @@ static esp_err_t http_save_post(httpd_req_t *req) {
     form_get(buf, "ping_ip", cfg.ping_ip, sizeof(cfg.ping_ip));
     form_get(buf, "ping_ip2", cfg.ping_ip2, sizeof(cfg.ping_ip2));
     form_get(buf, "ping_ip3", cfg.ping_ip3, sizeof(cfg.ping_ip3));
+    form_get(buf, "gs_url", cfg.gs_url, sizeof(cfg.gs_url));
+    form_get(buf, "gs_secret", cfg.gs_secret, sizeof(cfg.gs_secret));
+    form_get(buf, "device_id", cfg.device_id, sizeof(cfg.device_id));
+
+    // The Google fields contain a long URL/secret, so an empty form field means "keep current".
+    app_cfg_t old_cfg = {0};
+    (void)load_cfg_from_nvs(&old_cfg);
+    if (cfg.gs_url[0] == 0 && old_cfg.gs_url[0] != 0) {
+        snprintf(cfg.gs_url, sizeof(cfg.gs_url), "%s", old_cfg.gs_url);
+    }
+    if (cfg.gs_secret[0] == 0 && old_cfg.gs_secret[0] != 0) {
+        snprintf(cfg.gs_secret, sizeof(cfg.gs_secret), "%s", old_cfg.gs_secret);
+    }
+    if (cfg.device_id[0] == 0 && old_cfg.device_id[0] != 0) {
+        snprintf(cfg.device_id, sizeof(cfg.device_id), "%s", old_cfg.device_id);
+    }
 
     if (strlen(cfg.ssid) == 0 || strlen(cfg.pass) == 0 ||
         strlen(cfg.tg_token) == 0 || strlen(cfg.tg_chat) == 0 ||
@@ -878,7 +1011,9 @@ static void format_duration(int64_t sec, char *out, size_t out_sz) {
 }
 
 static void notify_power_off(int64_t off_time, int64_t last_on_time) {
-    char dur[64]; format_duration(off_time - last_on_time, dur, sizeof(dur));
+    int64_t duration_s = off_time - last_on_time;
+    if (duration_s < 0) duration_s = 0;
+    char dur[64]; format_duration(duration_s, dur, sizeof(dur));
 
     char msg[256];
     snprintf(msg, sizeof(msg),
@@ -886,11 +1021,14 @@ static void notify_power_off(int64_t off_time, int64_t last_on_time) {
              "Воно було: %s",
              dur);
 
+    (void)gsheets_post_event("OFF", off_time, duration_s);
     (void)tg_send_message(g_cfg.tg_token, g_cfg.tg_chat, msg);
 }
 
 static void notify_power_on(int64_t on_time, int64_t last_off_time) {
-    char dur[64]; format_duration(on_time - last_off_time, dur, sizeof(dur));
+    int64_t duration_s = on_time - last_off_time;
+    if (duration_s < 0) duration_s = 0;
+    char dur[64]; format_duration(duration_s, dur, sizeof(dur));
 
     char msg[256];
     snprintf(msg, sizeof(msg),
@@ -898,6 +1036,7 @@ static void notify_power_on(int64_t on_time, int64_t last_off_time) {
              "Його не було: %s",
              dur);
 
+    (void)gsheets_post_event("ON", on_time, duration_s);
     (void)tg_send_message(g_cfg.tg_token, g_cfg.tg_chat, msg);
 }
 
@@ -1118,6 +1257,12 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(3000));
     bool force_setup = is_button_held_at_boot();
     bool has_cfg = load_cfg_from_nvs(&g_cfg);
+    if (has_cfg) {
+        ESP_LOGI(TAG, "Google Sheets history: %s%s%s",
+                 gsheets_configured() ? "configured (device=" : "not configured",
+                 gsheets_configured() ? g_cfg.device_id : "",
+                 gsheets_configured() ? ")" : "");
+    }
 
     if (force_setup || !has_cfg) {
         display_ui_toast("      Entering config mode...");
