@@ -61,7 +61,7 @@ static const char *TAG = "power_pinger";
 
 // ✅ OFF тільки після N мс без жодного успішного ping
 // Рекомендовано 60000..120000, щоб не флапало від коротких провалів
-#define OFF_CONFIRM_MS          10000
+#define OFF_CONFIRM_MS          (2 * 60 * 1000)   // 2 minutes without a successful ping
 
 #define ON_CONFIRM_STREAK       3              // скільки success підряд потрібно для ON
 
@@ -71,6 +71,8 @@ static const char *TAG = "power_pinger";
 #define KEY_TG_TOKEN            "tg_token"
 #define KEY_TG_CHAT             "tg_chat"
 #define KEY_PING_IP             "ping_ip"
+#define KEY_PING_IP2            "ping_ip2"
+#define KEY_PING_IP3            "ping_ip3"
 #define KEY_LAST_STATUS         "last_stat"    // u8: 1=on, 0=off, 0xFF=unknown
 #define KEY_LAST_OFF_TIME       "last_off"     // i64 epoch
 #define KEY_LAST_ON_TIME        "last_on"      // i64 epoch
@@ -87,19 +89,31 @@ typedef struct {
     char pass[65];
     char tg_token[128];
     char tg_chat[64];
-    char ping_ip[16]; // "192.168.1.1"
+    char ping_ip[16];  // primary, required
+    char ping_ip2[16]; // optional
+    char ping_ip3[16]; // optional
     bool valid;
 } app_cfg_t;
 
 static app_cfg_t g_cfg;
 
 static httpd_handle_t g_httpd = NULL;
-static esp_ping_handle_t g_ping = NULL;
 
-static volatile bool last_ping_rez = false;
-static volatile bool g_ping_alive = false;
-static volatile int64_t g_last_ping_ok_ms = 0;
-static volatile uint32_t g_ping_ok_streak = 0;
+#define MAX_PING_TARGETS 3
+
+typedef struct {
+    esp_ping_handle_t handle;
+    const char *ip;
+    bool enabled;
+    volatile bool last_result;
+    volatile int64_t last_ok_ms;
+    volatile uint32_t ok_streak;
+} ping_target_t;
+
+static ping_target_t g_ping_targets[MAX_PING_TARGETS];
+static volatile bool last_ping_rez = false; // true if at least one enabled target's latest result is success
+static volatile int64_t g_last_ping_ok_ms = 0; // last successful reply from ANY target
+static volatile int64_t g_ping_monitor_started_ms = 0;
 
 static volatile bool inited = false;
 /* ---------- helpers ---------- */
@@ -126,6 +140,186 @@ static void reboot_now(void) {
 }
 
 /* ---------- NVS ---------- */
+static const char *nvs_type_name(nvs_type_t type) {
+    switch (type) {
+        case NVS_TYPE_U8:   return "u8";
+        case NVS_TYPE_I8:   return "i8";
+        case NVS_TYPE_U16:  return "u16";
+        case NVS_TYPE_I16:  return "i16";
+        case NVS_TYPE_U32:  return "u32";
+        case NVS_TYPE_I32:  return "i32";
+        case NVS_TYPE_U64:  return "u64";
+        case NVS_TYPE_I64:  return "i64";
+        case NVS_TYPE_STR:  return "str";
+        case NVS_TYPE_BLOB: return "blob";
+        default:            return "unknown";
+    }
+}
+
+static void nvs_dump_blob_hex(const char *ns, const char *key, nvs_handle_t h) {
+    size_t len = 0;
+    esp_err_t err = nvs_get_blob(h, key, NULL, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS [%s] %s: blob read failed: %s", ns, key, esp_err_to_name(err));
+        return;
+    }
+
+    if (len == 0) {
+        ESP_LOGI(TAG, "NVS [%s] %s (blob, 0 bytes) = <empty>", ns, key);
+        return;
+    }
+
+    uint8_t *data = malloc(len);
+    if (!data) {
+        ESP_LOGW(TAG, "NVS [%s] %s: no memory for %u-byte blob", ns, key, (unsigned)len);
+        return;
+    }
+
+    err = nvs_get_blob(h, key, data, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS [%s] %s: blob read failed: %s", ns, key, esp_err_to_name(err));
+        free(data);
+        return;
+    }
+
+    ESP_LOGI(TAG, "NVS [%s] %s (blob, %u bytes):", ns, key, (unsigned)len);
+    for (size_t off = 0; off < len; off += 32) {
+        char line[32 * 3 + 1];
+        size_t chunk = MIN((size_t)32, len - off);
+        char *w = line;
+        for (size_t i = 0; i < chunk; i++) {
+            int n = snprintf(w, (size_t)(line + sizeof(line) - w), "%02X%s",
+                             data[off + i], (i + 1 < chunk) ? " " : "");
+            if (n < 0) break;
+            w += n;
+        }
+        *w = '\0';
+        ESP_LOGI(TAG, "  %04u: %s", (unsigned)off, line);
+    }
+    free(data);
+}
+
+static void dump_all_nvs_entries(void) {
+    ESP_LOGI(TAG, "========== NVS DUMP BEGIN ==========");
+
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find("nvs", NULL, NVS_TYPE_ANY, &it);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "NVS is empty");
+        ESP_LOGI(TAG, "=========== NVS DUMP END ===========");
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_entry_find failed: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "=========== NVS DUMP END ===========");
+        return;
+    }
+
+    size_t count = 0;
+    while (err == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        count++;
+
+        nvs_handle_t h;
+        esp_err_t open_err = nvs_open_from_partition("nvs", info.namespace_name, NVS_READONLY, &h);
+        if (open_err != ESP_OK) {
+            ESP_LOGW(TAG, "NVS [%s] %s (%s): open failed: %s",
+                     info.namespace_name, info.key, nvs_type_name(info.type), esp_err_to_name(open_err));
+            err = nvs_entry_next(&it);
+            continue;
+        }
+
+        switch (info.type) {
+            case NVS_TYPE_U8: {
+                uint8_t v = 0; esp_err_t e = nvs_get_u8(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (u8) = %u", info.namespace_name, info.key, (unsigned)v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (u8): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_I8: {
+                int8_t v = 0; esp_err_t e = nvs_get_i8(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (i8) = %d", info.namespace_name, info.key, (int)v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (i8): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_U16: {
+                uint16_t v = 0; esp_err_t e = nvs_get_u16(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (u16) = %u", info.namespace_name, info.key, (unsigned)v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (u16): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_I16: {
+                int16_t v = 0; esp_err_t e = nvs_get_i16(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (i16) = %d", info.namespace_name, info.key, (int)v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (i16): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_U32: {
+                uint32_t v = 0; esp_err_t e = nvs_get_u32(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (u32) = %" PRIu32, info.namespace_name, info.key, v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (u32): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_I32: {
+                int32_t v = 0; esp_err_t e = nvs_get_i32(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (i32) = %" PRId32, info.namespace_name, info.key, v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (i32): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_U64: {
+                uint64_t v = 0; esp_err_t e = nvs_get_u64(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (u64) = %" PRIu64, info.namespace_name, info.key, v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (u64): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_I64: {
+                int64_t v = 0; esp_err_t e = nvs_get_i64(h, info.key, &v);
+                if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (i64) = %" PRId64, info.namespace_name, info.key, v);
+                else ESP_LOGW(TAG, "NVS [%s] %s (i64): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                break;
+            }
+            case NVS_TYPE_STR: {
+                size_t len = 0;
+                esp_err_t e = nvs_get_str(h, info.key, NULL, &len);
+                if (e == ESP_OK && len > 0) {
+                    char *v = malloc(len);
+                    if (v) {
+                        e = nvs_get_str(h, info.key, v, &len);
+                        if (e == ESP_OK) ESP_LOGI(TAG, "NVS [%s] %s (str) = \"%s\"", info.namespace_name, info.key, v);
+                        else ESP_LOGW(TAG, "NVS [%s] %s (str): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                        free(v);
+                    } else {
+                        ESP_LOGW(TAG, "NVS [%s] %s (str): no memory", info.namespace_name, info.key);
+                    }
+                } else if (e == ESP_OK) {
+                    ESP_LOGI(TAG, "NVS [%s] %s (str) = \"\"", info.namespace_name, info.key);
+                } else {
+                    ESP_LOGW(TAG, "NVS [%s] %s (str): %s", info.namespace_name, info.key, esp_err_to_name(e));
+                }
+                break;
+            }
+            case NVS_TYPE_BLOB:
+                nvs_dump_blob_hex(info.namespace_name, info.key, h);
+                break;
+            default:
+                ESP_LOGI(TAG, "NVS [%s] %s (type=0x%02X) = <unsupported type>",
+                         info.namespace_name, info.key, (unsigned)info.type);
+                break;
+        }
+
+        nvs_close(h);
+        err = nvs_entry_next(&it);
+    }
+
+    if (it != NULL) {
+        nvs_release_iterator(it);
+    }
+
+    ESP_LOGI(TAG, "NVS entries: %u", (unsigned)count);
+    ESP_LOGI(TAG, "=========== NVS DUMP END ===========");
+}
+
 static esp_err_t nvs_get_str_safe(nvs_handle_t h, const char *key, char *out, size_t out_sz) {
     size_t required = 0;
     esp_err_t err = nvs_get_str(h, key, NULL, &required);
@@ -144,6 +338,10 @@ static bool load_cfg_from_nvs(app_cfg_t *cfg) {
     esp_err_t e3 = nvs_get_str_safe(h, KEY_TG_TOKEN, cfg->tg_token, sizeof(cfg->tg_token));
     esp_err_t e4 = nvs_get_str_safe(h, KEY_TG_CHAT, cfg->tg_chat, sizeof(cfg->tg_chat));
     esp_err_t e5 = nvs_get_str_safe(h, KEY_PING_IP, cfg->ping_ip, sizeof(cfg->ping_ip));
+
+    // Optional targets: missing keys are valid for devices configured by older firmware.
+    (void)nvs_get_str_safe(h, KEY_PING_IP2, cfg->ping_ip2, sizeof(cfg->ping_ip2));
+    (void)nvs_get_str_safe(h, KEY_PING_IP3, cfg->ping_ip3, sizeof(cfg->ping_ip3));
     nvs_close(h);
 
     cfg->valid = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK && e4 == ESP_OK && e5 == ESP_OK &&
@@ -162,6 +360,8 @@ static bool save_cfg_to_nvs(const app_cfg_t *cfg) {
     err |= nvs_set_str(h, KEY_TG_TOKEN, cfg->tg_token);
     err |= nvs_set_str(h, KEY_TG_CHAT, cfg->tg_chat);
     err |= nvs_set_str(h, KEY_PING_IP, cfg->ping_ip);
+    err |= nvs_set_str(h, KEY_PING_IP2, cfg->ping_ip2);
+    err |= nvs_set_str(h, KEY_PING_IP3, cfg->ping_ip3);
     err |= nvs_commit(h);
     nvs_close(h);
     return (err == ESP_OK);
@@ -278,7 +478,9 @@ static const char *HTML_FORM =
 "<label>WiFi Password</label><input name='pass' type='password' required>"
 "<label>Telegram bot token</label><input name='tg_token' required>"
 "<label>Telegram channel/chat id</label><input name='tg_chat' required>"
-"<label>IP device to ping</label><input name='ping_ip' placeholder='192.168.1.1' required>"
+"<label>Ping IP 1 (required)</label><input name='ping_ip' placeholder='192.168.1.1' required>"
+"<label>Ping IP 2 (optional)</label><input name='ping_ip2' placeholder='1.1.1.1'>"
+"<label>Ping IP 3 (optional)</label><input name='ping_ip3' placeholder='8.8.8.8'>"
 "<button type='submit'>Save & Reboot</button>"
 "</form></body></html>";
 
@@ -349,6 +551,8 @@ static esp_err_t http_save_post(httpd_req_t *req) {
     form_get(buf, "tg_token", cfg.tg_token, sizeof(cfg.tg_token));
     form_get(buf, "tg_chat", cfg.tg_chat, sizeof(cfg.tg_chat));
     form_get(buf, "ping_ip", cfg.ping_ip, sizeof(cfg.ping_ip));
+    form_get(buf, "ping_ip2", cfg.ping_ip2, sizeof(cfg.ping_ip2));
+    form_get(buf, "ping_ip3", cfg.ping_ip3, sizeof(cfg.ping_ip3));
 
     if (strlen(cfg.ssid) == 0 || strlen(cfg.pass) == 0 ||
         strlen(cfg.tg_token) == 0 || strlen(cfg.tg_chat) == 0 ||
@@ -357,10 +561,18 @@ static esp_err_t http_save_post(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    // validate IP
+    // Validate required target and optional targets only when filled in.
     ip4_addr_t ip;
     if (!ip4addr_aton(cfg.ping_ip, &ip)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid IP");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Ping IP 1");
+        return ESP_FAIL;
+    }
+    if (cfg.ping_ip2[0] != 0 && !ip4addr_aton(cfg.ping_ip2, &ip)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Ping IP 2");
+        return ESP_FAIL;
+    }
+    if (cfg.ping_ip3[0] != 0 && !ip4addr_aton(cfg.ping_ip3, &ip)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid Ping IP 3");
         return ESP_FAIL;
     }
 
@@ -522,39 +734,84 @@ static void ntp_sync_time_or_reboot(void) {
 }
 
 /* ---------- PING ---------- */
-static void ping_on_success(esp_ping_handle_t hdl, void *args) {
-    (void)hdl; (void)args;
-    g_last_ping_ok_ms = now_ms();
-    g_ping_alive = true;
-    if (inited) {
-        display_ui_set_last_ping_try(now_epoch_s());
-        display_ui_set_ping(true);
+static bool any_latest_ping_ok(void) {
+    for (int i = 0; i < MAX_PING_TARGETS; i++) {
+        if (g_ping_targets[i].enabled && g_ping_targets[i].last_result) return true;
     }
+    return false;
+}
+
+static bool any_target_confirmed_on(void) {
+    int64_t now = now_ms();
+    for (int i = 0; i < MAX_PING_TARGETS; i++) {
+        ping_target_t *t = &g_ping_targets[i];
+        if (t->enabled && t->ok_streak >= ON_CONFIRM_STREAK &&
+            t->last_ok_ms > 0 && (now - t->last_ok_ms) < OFF_CONFIRM_MS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void update_ping_ui_from_aggregate(void) {
+    if (!inited) return;
+    bool recent = false;
+    int64_t last_ok = g_last_ping_ok_ms;
+    if (last_ok > 0 && (now_ms() - last_ok) < OFF_CONFIRM_MS) recent = true;
+    display_ui_set_last_ping_try(now_epoch_s());
+    display_ui_set_ping(recent);
+}
+
+static void ping_on_success(esp_ping_handle_t hdl, void *args) {
+    (void)hdl;
+    ping_target_t *t = (ping_target_t *)args;
+    if (!t) return;
+
+    int64_t now = now_ms();
+    t->last_ok_ms = now;
+    t->last_result = true;
+    if (t->ok_streak < 1000) t->ok_streak++;
+
+    g_last_ping_ok_ms = now;
     last_ping_rez = true;
-    if (g_ping_ok_streak < 1000) g_ping_ok_streak++;
+
+    ESP_LOGD(TAG, "Ping OK: %s (streak=%u)", t->ip ? t->ip : "?", (unsigned)t->ok_streak);
+    update_ping_ui_from_aggregate();
 }
 
 static void ping_on_timeout(esp_ping_handle_t hdl, void *args) {
-    (void)hdl; (void)args;
-    if (inited) {
-        display_ui_set_last_ping_try(now_epoch_s());
-        display_ui_set_ping(false);
-    }
-    last_ping_rez = false;
-    // ✅ НЕ обнуляємо streak від одного timeout
-    if (g_ping_ok_streak > 0) g_ping_ok_streak--;
+    (void)hdl;
+    ping_target_t *t = (ping_target_t *)args;
+    if (!t) return;
+
+    t->last_result = false;
+    // Preserve the old anti-flap behavior: one timeout only reduces the confirmation streak.
+    if (t->ok_streak > 0) t->ok_streak--;
+
+    last_ping_rez = any_latest_ping_ok();
+    ESP_LOGD(TAG, "Ping timeout: %s", t->ip ? t->ip : "?");
+    update_ping_ui_from_aggregate();
 }
 
-static esp_err_t ping_start(const char *ip_str) {
+static esp_err_t ping_start_one(int index, const char *ip_str) {
+    if (index < 0 || index >= MAX_PING_TARGETS || !ip_str || ip_str[0] == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     ip_addr_t target_addr;
     if (!ipaddr_aton(ip_str, &target_addr)) {
         ESP_LOGE(TAG, "Bad ping ip: %s", ip_str);
         return ESP_ERR_INVALID_ARG;
     }
 
+    ping_target_t *t = &g_ping_targets[index];
+    memset(t, 0, sizeof(*t));
+    t->ip = ip_str;
+    t->enabled = true;
+
     esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
     ping_config.target_addr = target_addr;
-    ping_config.count = 0; // бесконечно
+    ping_config.count = 0; // infinite
     ping_config.interval_ms = PING_INTERVAL_MS;
     ping_config.timeout_ms = 1500;
 
@@ -562,16 +819,51 @@ static esp_err_t ping_start(const char *ip_str) {
         .on_ping_success = ping_on_success,
         .on_ping_timeout = ping_on_timeout,
         .on_ping_end = NULL,
-        .cb_args = NULL
+        .cb_args = t
     };
 
-    esp_err_t err = esp_ping_new_session(&ping_config, &cbs, &g_ping);
-    if (err != ESP_OK) return err;
+    esp_err_t err = esp_ping_new_session(&ping_config, &cbs, &t->handle);
+    if (err != ESP_OK) {
+        t->enabled = false;
+        ESP_LOGE(TAG, "Cannot create ping session for %s: %s", ip_str, esp_err_to_name(err));
+        return err;
+    }
 
+    err = esp_ping_start(t->handle);
+    if (err != ESP_OK) {
+        t->enabled = false;
+        ESP_LOGE(TAG, "Cannot start ping session for %s: %s", ip_str, esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Ping target %d enabled: %s", index + 1, ip_str);
+    return ESP_OK;
+}
+
+static esp_err_t ping_start_all(void) {
+    memset(g_ping_targets, 0, sizeof(g_ping_targets));
     g_last_ping_ok_ms = 0;
-    g_ping_alive = false;
-    g_ping_ok_streak = 0;
-    return esp_ping_start(g_ping);
+    g_ping_monitor_started_ms = now_ms();
+    last_ping_rez = false;
+
+    const char *ips[MAX_PING_TARGETS] = {
+        g_cfg.ping_ip,
+        g_cfg.ping_ip2,
+        g_cfg.ping_ip3
+    };
+
+    int started = 0;
+    for (int i = 0; i < MAX_PING_TARGETS; i++) {
+        if (!ips[i] || ips[i][0] == 0) {
+            ESP_LOGI(TAG, "Ping target %d disabled (empty)", i + 1);
+            continue;
+        }
+        esp_err_t err = ping_start_one(i, ips[i]);
+        if (err != ESP_OK) return err;
+        started++;
+    }
+
+    return started > 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 /* ---------- LOGIC: power state machine ---------- */
@@ -609,11 +901,20 @@ static void notify_power_on(int64_t on_time, int64_t last_off_time) {
     (void)tg_send_message(g_cfg.tg_token, g_cfg.tg_chat, msg);
 }
 
-// ✅ "щось живе": був успішний ping за останні OFF_CONFIRM_MS
+// At least one target has replied during the OFF confirmation window.
 static bool ping_recent_ok(void) {
     int64_t last_ok = g_last_ping_ok_ms;
     if (last_ok == 0) return false;
     return (now_ms() - last_ok) < OFF_CONFIRM_MS;
+}
+
+// OFF is allowed only after a full OFF_CONFIRM_MS window without ANY successful reply.
+// After reboot this also gives the monitor a full two-minute grace period before declaring OFF.
+static bool no_ping_for_off_window(void) {
+    int64_t now = now_ms();
+    int64_t last_ok = g_last_ping_ok_ms;
+    if (last_ok > 0) return (now - last_ok) >= OFF_CONFIRM_MS;
+    return g_ping_monitor_started_ms > 0 && (now - g_ping_monitor_started_ms) >= OFF_CONFIRM_MS;
 }
 
 static void main_logic_task(void *arg) {
@@ -621,13 +922,13 @@ static void main_logic_task(void *arg) {
 
     display_ui_toast("   Obtaining current state...");
 
-    ESP_ERROR_CHECK(ping_start(g_cfg.ping_ip));
+    ESP_ERROR_CHECK(ping_start_all());
 
     int64_t n_s;
 
-    // Подождём немного, чтобы набрать "ON streak" (если цель реально доступна)
+    // Wait briefly for any configured target to confirm ON.
     int waited = 0;
-    while (g_ping_ok_streak < ON_CONFIRM_STREAK && waited < 8000) {
+    while (!any_target_confirmed_on() && waited < 8000) {
         vTaskDelay(pdMS_TO_TICKS(200));
         waited += 200;
         // n_s = now_epoch_s();
@@ -637,7 +938,12 @@ static void main_logic_task(void *arg) {
     EventBits_t bits0 = xEventGroupGetBits(s_wifi_event_group);
     bool wifi_ok0 = (bits0 & WIFI_CONNECTED_BIT);
 
-    bool is_on = wifi_ok0 && (g_ping_ok_streak >= ON_CONFIRM_STREAK) && ping_recent_ok();
+    uint8_t st = load_last_status(0xFF);
+    bool confirmed_on = wifi_ok0 && any_target_confirmed_on() && ping_recent_ok();
+    // Do not turn a previously-ON device OFF just because no target answered in the first few seconds after reboot.
+    // Runtime OFF detection below still requires the full two-minute no-success window.
+    bool is_on = confirmed_on || (st == 1 && wifi_ok0);
+
     n_s = now_epoch_s();
     int64_t l_on = load_i64(KEY_LAST_ON_TIME, n_s);
     int64_t l_of = load_i64(KEY_LAST_OFF_TIME, n_s);
@@ -656,7 +962,6 @@ static void main_logic_task(void *arg) {
 
     
     
-    uint8_t st = load_last_status(0xFF);
     ESP_LOGI(TAG, "Initial power status: %s, last_st=%u", is_on ? "ON" : "OFF", st);
     inited = true;
     // Первый запуск: просто запомнить, без уведомлений
@@ -705,8 +1010,8 @@ static void main_logic_task(void *arg) {
             continue;
         }
 
-        bool evidence_on  = (g_ping_ok_streak >= ON_CONFIRM_STREAK) && ping_recent_ok();
-        bool evidence_off = !ping_recent_ok();
+        bool evidence_on  = any_target_confirmed_on() && ping_recent_ok();
+        bool evidence_off = no_ping_for_off_window();
 
         if (st == 1 && last_ping_rez == false && !warning) {
             warning = true;
@@ -723,7 +1028,7 @@ static void main_logic_task(void *arg) {
             notify_power_off(off_time, last_on);
             st = 0;
             save_last_status(st);
-            ESP_LOGW(TAG, "POWER OFF event (confirmed %d ms no ping)", OFF_CONFIRM_MS);
+            ESP_LOGW(TAG, "POWER OFF event (confirmed %d ms with no successful ping from any target)", OFF_CONFIRM_MS);
             ui_set_screen_bg(0x990000);
             display_ui_set_power(false, off_time);
 
@@ -770,6 +1075,7 @@ static bool is_button_held_at_boot(void) {
 /* ---------- app_main ---------- */
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
+    dump_all_nvs_entries();
     ESP_LOGI(TAG, "Boot");
 
     // Настрой под свои пины!
