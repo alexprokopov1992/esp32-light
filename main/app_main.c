@@ -46,6 +46,7 @@
 
 #include "lcd_st7789.h"
 #include "display_ui.h"
+#include "report_calendar.h"
 
 static const char *TAG = "power_pinger";
 
@@ -79,8 +80,11 @@ static const char *TAG = "power_pinger";
 #define KEY_LAST_STATUS         "last_stat"    // u8: 1=on, 0=off, 0xFF=unknown
 #define KEY_LAST_OFF_TIME       "last_off"     // i64 epoch
 #define KEY_LAST_ON_TIME        "last_on"      // i64 epoch
-#define KEY_WEEKLY_REPORT_DAY   "wrep_day"     // u32 YYYYMMDD: last successful Tue-Sun 00:01 report
-#define KEY_WEEKLY_REPORT_FINAL "wrep_final"   // u32 YYYYMMDD: last successful Sunday 23:59 final report
+// Only a FULLY COMPLETED local day is checkpointed. Keep the legacy wrep_* keys
+// untouched: they corresponded to incomplete 00:01 / 23:59 snapshots.
+#define KEY_REPORT_LAST_DONE    "rpt_done"     // u32 YYYYMMDD: last acknowledged completed local day
+#define REPORT_RETRY_MS         (10 * 60 * 1000LL)
+#define REPORT_CATCHUP_GAP_MS   15000LL
 
 /* ---------- WiFi events ---------- */
 #define WIFI_CONNECTED_BIT BIT0
@@ -539,9 +543,9 @@ static esp_err_t gsheets_post_event(const char *state, int64_t ts, int64_t durat
 }
 
 /*
- * Ask the existing Google Apps Script to generate the current week graph and
- * send the PNG to Telegram. The Apps Script owns chart generation/sendPhoto;
- * ESP32 only triggers action=weekly_report.
+ * A report is identified by the COMPLETED local date being reported, not by
+ * when ESP32 happens to reconnect. The Apps Script must accept date=YYYY-MM-DD.
+ * Once confirmed, the checkpoint is stored in NVS and survives a reboot.
  */
 static void url_encode_query_value(const char *src, char *dst, size_t dst_sz) {
     static const char hex[] = "0123456789ABCDEF";
@@ -564,167 +568,151 @@ static void url_encode_query_value(const char *src, char *dst, size_t dst_sz) {
     dst[oi] = 0;
 }
 
-static esp_err_t gsheets_get_weekly_report(const char *slot_name) {
+typedef struct {
+    char body[96];
+    size_t used;
+} report_http_reply_t;
+
+static esp_err_t report_http_event(esp_http_client_event_t *evt) {
+    report_http_reply_t *reply = (report_http_reply_t *)evt->user_data;
+    if (!reply) return ESP_OK;
+    if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
+        // A ContentService redirect opens a new TLS connection to Google;
+        // discard any intermediate response body before reading the final one.
+        reply->body[0] = 0;
+        reply->used = 0;
+    }
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
+        size_t available = sizeof(reply->body) - 1 - reply->used;
+        size_t n = MIN((size_t)evt->data_len, available);
+        if (n) {
+            memcpy(reply->body + reply->used, evt->data, n);
+            reply->used += n;
+            reply->body[reply->used] = 0;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t gsheets_get_completed_day_report(uint32_t day) {
     if (!gsheets_configured()) {
-        ESP_LOGW(TAG, "Google Sheets report is not configured; slot=%s",
-                 slot_name ? slot_name : "?");
+        ESP_LOGW(TAG, "Google Sheets daily report is not configured");
         return ESP_ERR_INVALID_STATE;
     }
-
     char secret_enc[384];
     url_encode_query_value(g_cfg.gs_secret, secret_enc, sizeof(secret_enc));
 
     char url[768];
     const char sep = strchr(g_cfg.gs_url, '?') ? '&' : '?';
-    int n = snprintf(url, sizeof(url), "%s%caction=weekly_report&secret=%s",
-                     g_cfg.gs_url, sep, secret_enc);
+    int n = snprintf(url, sizeof(url),
+                     "%s%caction=weekly_report&date=%04" PRIu32 "-%02" PRIu32
+                     "-%02" PRIu32 "&secret=%s",
+                     g_cfg.gs_url, sep, day / 10000u, (day / 100u) % 100u,
+                     day % 100u, secret_enc);
     if (n < 0 || n >= (int)sizeof(url)) {
-        ESP_LOGE(TAG, "Weekly report URL too long");
+        ESP_LOGE(TAG, "GSheets report URL too long");
         return ESP_ERR_INVALID_SIZE;
     }
 
+    report_http_reply_t reply = {0};
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_GET,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 30000,
-        // Apps Script ContentService commonly responds with 302/303 after the script
-        // has already executed. Avoid following the redirect and treat 2xx/3xx as success.
-        .disable_auto_redirect = true,
+        .timeout_ms = 90000,
+        .event_handler = report_http_event,
+        .user_data = &reply,
+        // Follow the ContentService 302 to its googleusercontent.com result.
+        // This is GET -> GET (not the POST event webhook), and lets us verify
+        // the actual body: a redirect / "bad secret" alone must NOT acknowledge.
+        .disable_auto_redirect = false,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return ESP_FAIL;
-
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
         int code = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "GSheets weekly report HTTP %d slot=%s",
-                 code, slot_name ? slot_name : "?");
-        if (code < 200 || code >= 400) err = ESP_FAIL;
+        char accepted[48], duplicate[48];
+        snprintf(accepted, sizeof(accepted), "report sent %08" PRIu32, day);
+        snprintf(duplicate, sizeof(duplicate), "already sent %08" PRIu32, day);
+        bool confirmed = (strcmp(reply.body, accepted) == 0 ||
+                          strcmp(reply.body, duplicate) == 0);
+        ESP_LOGI(TAG, "GSheets completed-day HTTP %d date=%08" PRIu32
+                 " response-confirmed=%s", code, day, confirmed ? "yes" : "no");
+        if (code != 200 || !confirmed) err = ESP_FAIL;
     } else {
-        ESP_LOGW(TAG, "GSheets weekly report failed slot=%s: %s",
-                 slot_name ? slot_name : "?", esp_err_to_name(err));
+        ESP_LOGW(TAG, "GSheets completed-day report failed date=%08" PRIu32 ": %s",
+                 day, esp_err_to_name(err));
     }
-
     esp_http_client_cleanup(client);
     return err;
 }
 
-static uint32_t local_yyyymmdd(const struct tm *tm_local) {
-    if (!tm_local) return 0;
-    return (uint32_t)(tm_local->tm_year + 1900) * 10000u +
-           (uint32_t)(tm_local->tm_mon + 1) * 100u +
-           (uint32_t)tm_local->tm_mday;
-}
-
-static bool report_daily_slot_due(const struct tm *tm_local) {
-    if (!tm_local) return false;
-
-    // tm_wday: 0=Sunday, 1=Monday, 2=Tuesday, ... 6=Saturday.
-    // Monday has no scheduled report. Tue-Sun become due after 00:01.
-    // At Sunday 23:59 the final slot takes precedence; do not send a missed
-    // 00:01 snapshot immediately before the final snapshot.
-    if (tm_local->tm_wday == 1) return false;
-    if (tm_local->tm_wday == 0 && tm_local->tm_hour == 23 && tm_local->tm_min == 59) {
-        return false;
-    }
-    return (tm_local->tm_hour > 0) ||
-           (tm_local->tm_hour == 0 && tm_local->tm_min >= 1);
-}
-
-static bool report_sunday_final_slot_due(const struct tm *tm_local) {
-    if (!tm_local) return false;
-    return tm_local->tm_wday == 0 &&
-           tm_local->tm_hour == 23 &&
-           tm_local->tm_min == 59;
-}
-
 /*
- * Schedule in Europe/Kyiv local time:
- *   Monday    - no regular report
- *   Tue-Sun   - 00:01, once per local date
- *   Sunday    - additionally 23:59 final snapshot
+ * Europe/Kyiv schedule:
+ *   Every day after 00:02: report the PREVIOUS COMPLETED calendar day.
+ *   Monday 00:02 therefore sends Sunday's COMPLETE 7-day weekly report.
+ *   Offline/backlog: send each missing date in order, spaced at least 15 s.
+ *   Failure: retry same date after 10 minutes; never advance the checkpoint.
+ *   First installation: start with yesterday (no unbounded historical replay).
  *
- * Daily report failures are retried every 10 minutes while the slot remains due.
- * Sunday 23:59 is special: retries are every 10 seconds until midnight so that a
- * retry cannot accidentally generate the next week's graph on Monday.
+ * The Apps Script must be deployed before flashing this firmware.
  */
 static void weekly_report_task(void *arg) {
     (void)arg;
-
     ESP_LOGI(TAG,
-             "Weekly graph scheduler started: Tue-Sun 00:01; Sun 23:59; timezone=Europe/Kyiv");
+             "Completed-day reports: daily >=00:02 Europe/Kyiv; catch-up enabled");
 
-    int64_t daily_retry_after_ms = 0;
-    int64_t final_retry_after_ms = 0;
-    uint32_t daily_retry_date = 0;
-    uint32_t final_retry_date = 0;
-    uint32_t sent_day = load_u32(KEY_WEEKLY_REPORT_DAY, 0);
-    uint32_t sent_final = load_u32(KEY_WEEKLY_REPORT_FINAL, 0);
+    uint32_t last_done = load_u32(KEY_REPORT_LAST_DONE, 0);
+    int64_t next_attempt_ms = 0;
 
     while (1) {
         EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-        bool wifi_ok = (bits & WIFI_CONNECTED_BIT) != 0;
-
         time_t now = time(NULL);
-        if (wifi_ok && now > 1700000000) {
-            struct tm tm_local;
-            localtime_r(&now, &tm_local);
-            uint32_t today = local_yyyymmdd(&tm_local);
-            int64_t mono_ms = now_ms();
+        if ((bits & WIFI_CONNECTED_BIT) && now > 1700000000) {
+            struct tm local;
+            localtime_r(&now, &local);
+            const uint32_t today = local_yyyymmdd(&local);
+            const uint32_t yesterday = report_shift_day(today, -1);
+            const uint32_t eligible_through = report_after_daily_cutoff(&local)
+                ? yesterday : report_shift_day(yesterday, -1);
 
-            if (daily_retry_date != today) {
-                daily_retry_date = today;
-                daily_retry_after_ms = 0;
-            }
-            if (final_retry_date != today) {
-                final_retry_date = today;
-                final_retry_after_ms = 0;
-            }
-
-            if (report_daily_slot_due(&tm_local)) {
-                if (sent_day != today && mono_ms >= daily_retry_after_ms) {
-                    ESP_LOGI(TAG, "Weekly graph daily slot due: %08" PRIu32, today);
-                    esp_err_t err = gsheets_get_weekly_report("daily-00:01");
-                    if (err == ESP_OK) {
-                        // Mark in RAM even if NVS commit fails, so one successful HTTP call
-                        // cannot cause duplicate Telegram graphs every 5 seconds this boot.
-                        sent_day = today;
-                        if (save_u32(KEY_WEEKLY_REPORT_DAY, today)) {
-                            ESP_LOGI(TAG, "Weekly graph daily slot marked sent: %08" PRIu32, today);
-                        } else {
-                            ESP_LOGW(TAG, "Weekly graph sent, but failed to persist wrep_day");
-                        }
-                        daily_retry_after_ms = 0;
-                    } else {
-                        daily_retry_after_ms = mono_ms + (10 * 60 * 1000LL);
-                        ESP_LOGW(TAG, "Weekly graph daily slot retry in 10 minutes");
-                    }
+            if (last_done == 0 && yesterday != 0) {
+                // Establish a durable starting point on initial deployment.
+                // Old wrep_day/wrep_final are NOT full-day checkpoints.
+                last_done = report_shift_day(yesterday, -1);
+                if (!save_u32(KEY_REPORT_LAST_DONE, last_done)) {
+                    ESP_LOGW(TAG, "Could not persist initial report baseline");
                 }
+                ESP_LOGI(TAG, "Daily report baseline date=%08" PRIu32, last_done);
             }
 
-            if (report_sunday_final_slot_due(&tm_local)) {
-                if (sent_final != today && mono_ms >= final_retry_after_ms) {
-                    ESP_LOGI(TAG, "Weekly graph Sunday final slot due: %08" PRIu32, today);
-                    esp_err_t err = gsheets_get_weekly_report("sunday-23:59");
+            if (last_done && eligible_through && last_done < eligible_through &&
+                now_ms() >= next_attempt_ms) {
+                const uint32_t requested_day = report_shift_day(last_done, 1);
+                if (requested_day == 0) {
+                    ESP_LOGE(TAG, "Invalid report checkpoint date=%08" PRIu32, last_done);
+                    next_attempt_ms = now_ms() + REPORT_RETRY_MS;
+                } else {
+                    ESP_LOGI(TAG, "Requesting completed-day report %08" PRIu32
+                             " (eligible through %08" PRIu32 ")",
+                             requested_day, eligible_through);
+                    esp_err_t err = gsheets_get_completed_day_report(requested_day);
                     if (err == ESP_OK) {
-                        sent_final = today;
-                        if (save_u32(KEY_WEEKLY_REPORT_FINAL, today)) {
-                            ESP_LOGI(TAG, "Weekly graph Sunday final slot marked sent: %08" PRIu32, today);
-                        } else {
-                            ESP_LOGW(TAG, "Sunday final graph sent, but failed to persist wrep_final");
+                        last_done = requested_day;
+                        if (!save_u32(KEY_REPORT_LAST_DONE, last_done)) {
+                            ESP_LOGW(TAG, "Report acknowledged, but NVS checkpoint failed");
                         }
-                        final_retry_after_ms = 0;
+                        next_attempt_ms = now_ms() + REPORT_CATCHUP_GAP_MS;
                     } else {
-                        final_retry_after_ms = mono_ms + 10000LL;
-                        ESP_LOGW(TAG, "Sunday final graph retry in 10 seconds (until midnight)");
+                        next_attempt_ms = now_ms() + REPORT_RETRY_MS;
+                        ESP_LOGW(TAG, "Report %08" PRIu32 " retry in 10 minutes",
+                                 requested_day);
                     }
                 }
             }
         }
-
-        // Fine enough to hit 23:59 promptly without burdening the ESP32.
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
